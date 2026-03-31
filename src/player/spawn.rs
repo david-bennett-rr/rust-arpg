@@ -6,8 +6,8 @@ use crate::combat::{FlashTint, HitFlash, HitPoints};
 use crate::world::tilemap::{PLAYER_SPAWN_GRID, grid_to_world};
 
 use super::{
-    DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget, Player, PlayerCombat,
-    PlayerStats, PLAYER_MAX_HP,
+    ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget,
+    Player, PlayerCombat, PlayerStats, PLAYER_MAX_HP,
 };
 
 pub(super) fn spawn_player(
@@ -108,11 +108,15 @@ pub(super) fn spawn_player(
     );
     let sword_handle_mesh = meshes.add(Cylinder::new(0.035, 0.26).mesh().resolution(4));
     let sword_guard_mesh = meshes.add(Cylinder::new(0.025, 0.34).mesh().resolution(4));
+    let shield_face_mesh = meshes.add(Cylinder::new(0.26, 0.04).mesh().resolution(8));
+    let shield_rim_mesh = meshes.add(Cylinder::new(0.29, 0.02).mesh().resolution(8));
+    let shield_boss_mesh = meshes.add(Sphere::new(0.07).mesh().ico(1).unwrap());
 
     let player = commands
         .spawn((
             Player,
             MoveTarget { position: None },
+            ControllerMove::default(),
             PlayerCombat::default(),
             Dodge::default(),
             PlayerStats::default(),
@@ -298,6 +302,30 @@ pub(super) fn spawn_player(
                                 MeshMaterial3d(dark_steel.clone()),
                                 Transform::from_xyz(0.0, -0.58, 0.0),
                                 FlashTint { owner: player, base_srgb: dark_steel_color },
+                            ));
+                            // Shield
+                            arm.spawn((
+                                Mesh3d(shield_rim_mesh.clone()),
+                                MeshMaterial3d(dark_steel.clone()),
+                                Transform::from_xyz(-0.06, -0.30, 0.16)
+                                    .with_rotation(Quat::from_rotation_x(PI / 2.0))
+                                    .with_scale(Vec3::new(1.0, 1.0, 0.85)),
+                                FlashTint { owner: player, base_srgb: dark_steel_color },
+                            ));
+                            arm.spawn((
+                                Mesh3d(shield_face_mesh.clone()),
+                                MeshMaterial3d(steel.clone()),
+                                Transform::from_xyz(-0.06, -0.30, 0.16)
+                                    .with_rotation(Quat::from_rotation_x(PI / 2.0))
+                                    .with_scale(Vec3::new(1.0, 1.0, 0.85)),
+                                FlashTint { owner: player, base_srgb: steel_color },
+                            ));
+                            arm.spawn((
+                                Mesh3d(shield_boss_mesh.clone()),
+                                MeshMaterial3d(trim.clone()),
+                                Transform::from_xyz(-0.06, -0.30, 0.20)
+                                    .with_scale(Vec3::new(1.0, 0.65, 1.0)),
+                                FlashTint { owner: player, base_srgb: trim_color },
                             ));
                         });
 

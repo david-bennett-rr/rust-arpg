@@ -2,5 +2,5 @@
 *.pdb
 /.claude/
 /debug.log
-/smoke_boot_stdout.txt
-/smoke_boot_stderr.txt
+/.smoke/
+/smoke_*.txt

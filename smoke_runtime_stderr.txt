@@ -1,3 +1,0 @@
-[2m2026-03-31T17:07:14.051950Z[0m [33m WARN[0m [2mwgpu_hal::dx12::shader_compilation[0m[2m:[0m Failed to load dxcompiler.dll. Defaulting to FXC instead: LoadLibraryExW failed: Some(Os { code: 126, kind: Uncategorized, message: "The specified module could not be found." })
-[2m2026-03-31T17:07:14.439318Z[0m [33m WARN[0m [2mwgpu_hal::vulkan::conv[0m[2m:[0m Unrecognized present mode 1000361000
-[2m2026-03-31T17:07:14.443474Z[0m [33m WARN[0m [2mwgpu_hal::vulkan::conv[0m[2m:[0m Unrecognized present mode 1000361000

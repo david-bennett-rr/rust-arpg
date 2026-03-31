@@ -8,7 +8,7 @@ use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::tilemap::{clamp_translation_to_arena, grid_to_world};
 
 use super::{
-    EnemyCollision, SlashTarget, UniqueEnemyMaterials, build_player_slash_state,
+    Dying, EnemyCollision, SlashTarget, UniqueEnemyMaterials, build_player_slash_state,
     try_player_slash,
 };
 
@@ -25,12 +25,12 @@ pub struct DemonRat {
 }
 
 #[derive(Component, Clone, Copy)]
-pub(super) struct RatOwner(Entity);
+pub(super) struct RatOwner(pub(super) Entity);
 
 #[derive(Component, Clone, Copy)]
 pub(super) struct RatRest {
-    translation: Vec3,
-    rotation: Quat,
+    pub(super) translation: Vec3,
+    pub(super) rotation: Quat,
 }
 
 impl RatRest {
@@ -72,7 +72,7 @@ type RatActors<'w, 's> = Query<
         &'static mut StunMeter,
         &'static mut HitFlash,
     ),
-    Without<Player>,
+    (Without<Player>, Without<Dying>),
 >;
 
 const RAT_MOVE_SPEED: f32 = 3.25;
@@ -477,7 +477,7 @@ pub(super) fn update_demon_rats(
 
 pub(super) fn animate_demon_rats(
     time: Res<Time>,
-    rats: Query<&DemonRat>,
+    rats: Query<&DemonRat, Without<Dying>>,
     mut joints: Query<(&RatOwner, &RatJoint, &RatRest, &mut Transform)>,
 ) {
     for (owner, joint, rest, mut transform) in &mut joints {
@@ -488,6 +488,7 @@ pub(super) fn animate_demon_rats(
         transform.translation = rest.translation;
         transform.rotation = rest.rotation;
 
+        let t = time.elapsed_secs();
         let move_wave = rat.gait_phase.sin() * rat.move_blend;
         let move_bob = (rat.gait_phase * 2.0).sin() * 0.04 * rat.move_blend;
         let attack_progress = rat_attack_progress(rat.chomp);
@@ -495,22 +496,64 @@ pub(super) fn animate_demon_rats(
         let bite = attack_progress.map(rat_nibble_curve).unwrap_or(0.0);
         let alert = if rat.alerted { 1.0 } else { 0.0 };
 
+        // Idle fidgeting (when not moving or attacking)
+        let idle = rat.move_blend == 0.0 && rat.chomp <= 0.0;
+        let sniff = if idle {
+            // Quick periodic sniffing motion
+            let sniff_cycle = (t * 3.5 + rat.home.x * 1.7).sin();
+            let sniff_burst = (sniff_cycle * 0.5 + 0.5).powi(4);
+            sniff_burst
+        } else {
+            0.0
+        };
+        let idle_look = if idle {
+            (t * 0.7 + rat.home.z * 0.9).sin()
+        } else {
+            0.0
+        };
+        let idle_breath = if idle {
+            (t * 1.8 + rat.home.x * 0.5).sin()
+        } else {
+            0.0
+        };
+
         match joint {
             RatJoint::Body => {
-                transform.translation.y += move_bob + hop * 0.08;
-                transform.rotation *= Quat::from_rotation_x(-bite * 0.16 - hop * 0.06)
-                    * Quat::from_rotation_z(move_wave * 0.06);
+                transform.translation.y += move_bob + hop * 0.08 + idle_breath * 0.008;
+                transform.rotation *= Quat::from_rotation_x(
+                    -bite * 0.16 - hop * 0.06
+                    + idle_breath * 0.012
+                    + sniff * 0.03,
+                )
+                    * Quat::from_rotation_z(move_wave * 0.06)
+                    * Quat::from_rotation_y(idle_look * 0.04);
             }
             RatJoint::Head => {
                 transform.translation.y += move_bob * 0.6 + hop * 0.05;
-                transform.rotation *= Quat::from_rotation_x(bite * 0.70 - alert * 0.05)
-                    * Quat::from_rotation_y(move_wave * 0.12);
+                transform.rotation *= Quat::from_rotation_x(
+                    bite * 0.70 - alert * 0.05
+                    + sniff * 0.14,
+                )
+                    * Quat::from_rotation_y(
+                        move_wave * 0.12
+                        + idle_look * 0.22
+                    );
             }
             RatJoint::Tail => {
                 let tail_sway =
-                    (rat.gait_phase * 0.75 + time.elapsed_secs() + rat.home.x * 0.06).sin();
+                    (rat.gait_phase * 0.75 + t + rat.home.x * 0.06).sin();
+                let idle_tail_flick = if idle {
+                    let flick = (t * 1.2 + rat.home.z * 2.3).sin();
+                    let burst = (flick * 0.5 + 0.5).powi(6);
+                    burst * 0.35
+                } else {
+                    0.0
+                };
                 transform.rotation *=
-                    Quat::from_rotation_y(tail_sway * (0.24 + rat.move_blend * 0.22))
+                    Quat::from_rotation_y(
+                        tail_sway * (0.24 + rat.move_blend * 0.22)
+                        + idle_tail_flick,
+                    )
                         * Quat::from_rotation_x(bite * 0.10 - hop * 0.12);
             }
         }

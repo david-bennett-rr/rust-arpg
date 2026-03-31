@@ -5,8 +5,8 @@ use bevy::prelude::*;
 use crate::combat::{HitPoints, smoothstep01};
 
 use super::{
-    DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget, Player, PlayerCombat,
-    DEATH_ANIM_DURATION,
+    ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget, Player,
+    PlayerCombat, DEATH_ANIM_DURATION,
 };
 
 pub(super) fn animate_knight(
@@ -14,6 +14,7 @@ pub(super) fn animate_knight(
     mut player: Single<
         (
             &MoveTarget,
+            &ControllerMove,
             &Dodge,
             &HitPoints,
             &mut KnightAnimator,
@@ -23,7 +24,7 @@ pub(super) fn animate_knight(
     >,
     mut joints: Query<(&KnightJoint, &JointRest, &mut Transform)>,
 ) {
-    let (move_target, dodge, hp, ref mut animator, ref mut combat) = *player;
+    let (move_target, controller_move, dodge, hp, ref mut animator, ref mut combat) = *player;
 
     // Don't fight with animate_death over joint transforms
     if hp.is_dead() {
@@ -37,12 +38,14 @@ pub(super) fn animate_knight(
         animator.swing_timer.tick(time.delta());
     }
 
-    if move_target.position.is_some() {
+    let moving = move_target.position.is_some() || controller_move.active();
+
+    if moving {
         animator.walk_phase += time.delta_secs() * 8.0;
         animator.walk_phase %= 100.0 * std::f32::consts::TAU;
     }
 
-    let moving = move_target.position.is_some();
+    let elapsed = time.elapsed_secs();
     let walk_swing = if moving {
         animator.walk_phase.sin()
     } else {
@@ -50,6 +53,19 @@ pub(super) fn animate_knight(
     };
     let walk_bob = if moving {
         (animator.walk_phase * 2.0).sin() * 0.06
+    } else {
+        0.0
+    };
+
+    // Idle breathing / weight-shift (only when standing still and not swinging)
+    let idle = !moving && !dodge.active && animator.swing_timer.finished();
+    let breath = if idle {
+        (elapsed * 1.4).sin()
+    } else {
+        0.0
+    };
+    let idle_shift = if idle {
+        (elapsed * 0.6).sin()
     } else {
         0.0
     };
@@ -124,44 +140,66 @@ pub(super) fn animate_knight(
 
         match joint {
             KnightJoint::Hips => {
-                transform.translation.y += walk_bob;
+                transform.translation.y += walk_bob + breath * 0.008;
                 transform.rotation *= Quat::from_rotation_x(-sword_strike * 0.04)
                     * Quat::from_rotation_y(
-                        walk_swing * 0.05 - sword_windup * 0.06 + sword_strike * 0.10,
-                    );
+                        walk_swing * 0.05 - sword_windup * 0.06 + sword_strike * 0.10
+                        + idle_shift * 0.018,
+                    )
+                    * Quat::from_rotation_z(idle_shift * 0.012);
             }
             KnightJoint::Chest => {
-                transform.translation.y += walk_bob * 0.4;
+                transform.translation.y += walk_bob * 0.4 + breath * 0.014;
                 transform.rotation *=
-                    Quat::from_rotation_x(sword_windup * 0.16 - sword_strike * 0.28)
+                    Quat::from_rotation_x(
+                        sword_windup * 0.16 - sword_strike * 0.28
+                        + breath * 0.018,
+                    )
                         * Quat::from_rotation_y(
-                            -walk_swing * 0.08 - sword_windup * 0.10 + sword_strike * 0.12,
+                            -walk_swing * 0.12 - sword_windup * 0.10 + sword_strike * 0.12
+                            - idle_shift * 0.012,
                         )
                         * Quat::from_rotation_z(-sword_windup * 0.04 + sword_strike * 0.06);
             }
             KnightJoint::Head => {
                 transform.rotation *=
-                    Quat::from_rotation_x(sword_windup * 0.04 - sword_strike * 0.05)
-                        * Quat::from_rotation_y(sword_windup * 0.03 - sword_strike * 0.05);
+                    Quat::from_rotation_x(
+                        sword_windup * 0.04 - sword_strike * 0.05
+                        - breath * 0.010
+                        - walk_bob * 0.15,
+                    )
+                        * Quat::from_rotation_y(
+                            sword_windup * 0.03 - sword_strike * 0.05
+                            + idle_shift * 0.035
+                            + walk_swing * 0.04,
+                        );
             }
             KnightJoint::LeftArm => {
                 transform.rotation *=
                     Quat::from_rotation_x(
-                        -walk_swing * 0.45 + sword_windup * 0.08 - sword_strike * 0.04,
-                    ) * Quat::from_rotation_z(sword_windup * 0.04 + sword_strike * 0.06);
+                        -walk_swing * 0.50 + sword_windup * 0.08 - sword_strike * 0.04
+                        + breath * 0.02,
+                    ) * Quat::from_rotation_z(
+                        sword_windup * 0.04 + sword_strike * 0.06
+                        - idle_shift * 0.015,
+                    );
             }
             KnightJoint::RightArm => {
                 transform.rotation *=
                     Quat::from_rotation_x(
-                        walk_swing * 0.12 + sword_windup * 1.86 - sword_strike * 2.48,
+                        walk_swing * 0.18 + sword_windup * 1.86 - sword_strike * 2.48
+                        - breath * 0.015,
                     ) * Quat::from_rotation_y(sword_windup * 0.22 - sword_strike * 0.16)
-                        * Quat::from_rotation_z(sword_windup * 0.10 - sword_strike * 0.18);
+                        * Quat::from_rotation_z(
+                            sword_windup * 0.10 - sword_strike * 0.18
+                            + idle_shift * 0.012,
+                        );
             }
             KnightJoint::LeftLeg => {
-                transform.rotation *= Quat::from_rotation_x(walk_swing * 0.55);
+                transform.rotation *= Quat::from_rotation_x(walk_swing * 0.60);
             }
             KnightJoint::RightLeg => {
-                transform.rotation *= Quat::from_rotation_x(-walk_swing * 0.55);
+                transform.rotation *= Quat::from_rotation_x(-walk_swing * 0.60);
             }
             KnightJoint::Sword => {
                 transform.rotation *=

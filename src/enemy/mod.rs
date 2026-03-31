@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use bevy::{asset::AssetId, prelude::*};
 use smallvec::SmallVec;
 
-use crate::combat::{DamageRng, HitFlash, HitPoints, StunMeter, game_running};
+use crate::combat::{DamageRng, HitFlash, HitPoints, StunMeter, game_running, smoothstep01};
 use crate::player::{
     Dodge, PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerSet, visual_forward,
 };
-use crate::targeting::TargetState;
+use crate::targeting::{HighlightGlow, Targetable, TargetState};
 use crate::world::tilemap::clamp_translation_to_arena;
 
 pub use arrow::Arrow;
@@ -40,12 +40,37 @@ impl Plugin for EnemyPlugin {
                     rat::animate_demon_rats,
                     goblin::animate_goblin_archers,
                     resolve_actor_collisions,
+                    update_dying,
+                    animate_dying_rats,
+                    animate_dying_goblins,
                 )
                     .chain()
                     .run_if(game_running)
                     .after(PlayerSet::Update),
             )
             .add_systems(Update, handle_respawn_enemies);
+    }
+}
+
+const ENEMY_DEATH_DURATION: f32 = 0.9;
+
+/// Marks an enemy that is playing its death animation before being despawned.
+#[derive(Component)]
+pub(crate) struct Dying {
+    pub(crate) timer: f32,
+    pub(crate) duration: f32,
+}
+
+impl Dying {
+    pub(crate) fn new() -> Self {
+        Self {
+            timer: 0.0,
+            duration: ENEMY_DEATH_DURATION,
+        }
+    }
+
+    pub(crate) fn progress(&self) -> f32 {
+        (self.timer / self.duration).clamp(0.0, 1.0)
     }
 }
 
@@ -104,7 +129,7 @@ pub(crate) fn build_player_slash_state<'a>(
     }
 }
 
-/// Returns `true` if the entity was killed and despawned.
+/// Returns `true` if the entity was killed (enters `Dying` state).
 pub(crate) fn try_player_slash(
     commands: &mut Commands,
     entity: Entity,
@@ -128,14 +153,19 @@ pub(crate) fn try_player_slash(
             target.stun.apply_stun_damage(damage as f32);
             target.flash.trigger();
             if target.health.is_dead() {
-                // Clear targeting refs before despawn to avoid stale entity access
+                // Clear targeting refs and disable collision/targeting
                 if target_state.targeted == Some(entity) {
                     target_state.targeted = None;
                 }
                 if target_state.hovered == Some(entity) {
                     target_state.hovered = None;
                 }
-                commands.entity(entity).despawn_recursive();
+                commands
+                    .entity(entity)
+                    .insert(Dying::new())
+                    .remove::<EnemyCollision>()
+                    .remove::<Targetable>()
+                    .remove::<HighlightGlow>();
                 return true;
             }
         }
@@ -268,6 +298,102 @@ fn resolve_overlap(a: &mut Vec2, b: &mut Vec2, minimum_distance: f32, a_push_rat
     *a -= direction * a_push;
     *b += direction * b_push;
     true
+}
+
+fn update_dying(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut dying_query: Query<(Entity, &mut Dying, &mut Transform)>,
+) {
+    let delta = time.delta_secs();
+    for (entity, mut dying, mut transform) in &mut dying_query {
+        dying.timer += delta;
+        let t = smoothstep01(dying.progress());
+
+        // Fall sideways and sink into the ground
+        transform.translation.y = -t * 0.4;
+        // Scale down slightly at end
+        let shrink = 1.0 - t * 0.3;
+        transform.scale = Vec3::splat(shrink);
+
+        if dying.timer >= dying.duration {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+/// Animate dying rats: body tips over
+fn animate_dying_rats(
+    rats: Query<(&DemonRat, &Dying)>,
+    mut joints: Query<(&rat::RatOwner, &rat::RatJoint, &rat::RatRest, &mut Transform)>,
+) {
+    for (owner, joint, rest, mut transform) in &mut joints {
+        let Ok((_, dying)) = rats.get(owner.0) else {
+            continue;
+        };
+        let t = smoothstep01(dying.progress());
+        transform.translation = rest.translation;
+        transform.rotation = rest.rotation;
+
+        match joint {
+            rat::RatJoint::Body => {
+                transform.rotation *= Quat::from_rotation_z(t * std::f32::consts::FRAC_PI_2);
+                transform.translation.y -= t * 0.15;
+            }
+            rat::RatJoint::Head => {
+                transform.rotation *= Quat::from_rotation_x(t * 0.4)
+                    * Quat::from_rotation_z(t * 0.2);
+            }
+            rat::RatJoint::Tail => {
+                transform.rotation *= Quat::from_rotation_y(-t * 0.6);
+            }
+        }
+    }
+}
+
+/// Animate dying goblins: crumple and fall forward
+fn animate_dying_goblins(
+    goblins: Query<(&GoblinArcher, &Dying)>,
+    mut joints: Query<(
+        &goblin::GoblinOwner,
+        &goblin::GoblinJoint,
+        &goblin::GoblinRest,
+        &mut Transform,
+    )>,
+) {
+    for (owner, joint, rest, mut transform) in &mut joints {
+        let Ok((_, dying)) = goblins.get(owner.0) else {
+            continue;
+        };
+        let t = smoothstep01(dying.progress());
+        transform.translation = rest.translation;
+        transform.rotation = rest.rotation;
+
+        match joint {
+            goblin::GoblinJoint::Body => {
+                transform.rotation *= Quat::from_rotation_x(t * 0.8);
+                transform.translation.y -= t * 0.3;
+            }
+            goblin::GoblinJoint::Head => {
+                transform.rotation *= Quat::from_rotation_x(t * 0.5);
+            }
+            goblin::GoblinJoint::LeftArm => {
+                transform.rotation *= Quat::from_rotation_x(-t * 0.7)
+                    * Quat::from_rotation_z(-t * 0.3);
+            }
+            goblin::GoblinJoint::RightArm => {
+                transform.rotation *= Quat::from_rotation_x(-t * 0.9)
+                    * Quat::from_rotation_z(t * 0.3);
+            }
+            goblin::GoblinJoint::LeftLeg => {
+                transform.rotation *= Quat::from_rotation_x(-t * 0.4);
+            }
+            goblin::GoblinJoint::RightLeg => {
+                transform.rotation *= Quat::from_rotation_x(-t * 0.4);
+            }
+            goblin::GoblinJoint::Bow => {}
+        }
+    }
 }
 
 fn handle_respawn_enemies(

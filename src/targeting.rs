@@ -3,6 +3,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::camera::MainCamera;
 use crate::combat::{HitPoints, StunMeter};
+use crate::hud::PauseMenuState;
 use crate::player::PlayerSet;
 
 pub struct TargetingPlugin;
@@ -140,7 +141,7 @@ fn spawn_target_ui(mut commands: Commands) {
 fn update_hover(
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     camera_query: Option<Single<(&Camera, &GlobalTransform), With<MainCamera>>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    pause_menu: Option<Res<PauseMenuState>>,
     targetables: Query<(Entity, &GlobalTransform, &Targetable)>,
     mut state: ResMut<TargetState>,
 ) {
@@ -153,8 +154,8 @@ fn update_hover(
 
     state.hovered = None;
 
-    if keyboard.just_pressed(KeyCode::Escape) {
-        state.targeted = None;
+    if pause_menu.as_ref().is_some_and(|pause_menu| pause_menu.open) {
+        return;
     }
 
     let Some(window) = window else {

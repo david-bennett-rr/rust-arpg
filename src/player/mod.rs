@@ -20,11 +20,14 @@ impl Plugin for PlayerPlugin {
             .add_systems(
                 Update,
                 (
+                    systems::update_controller_move_state,
                     systems::handle_left_click,
+                    systems::handle_controller_targeting,
                     systems::chase_and_attack_target,
                     systems::trigger_dodge,
                     systems::update_dodge,
                     systems::regen_stamina,
+                    systems::move_player_with_controller,
                     systems::move_player,
                     animation::animate_knight,
                 )
@@ -42,6 +45,17 @@ pub struct Player;
 #[derive(Component)]
 pub struct MoveTarget {
     pub position: Option<Vec2>,
+}
+
+#[derive(Component, Default)]
+pub struct ControllerMove {
+    pub input: Vec2,
+}
+
+impl ControllerMove {
+    pub fn active(&self) -> bool {
+        self.input.length_squared() > 0.0001
+    }
 }
 
 #[derive(Component, Default)]
