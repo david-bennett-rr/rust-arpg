@@ -144,10 +144,10 @@ fn update_hover(
     mut state: ResMut<TargetState>,
 ) {
     // Clear dead targets
-    if let Some(targeted) = state.targeted {
-        if targetables.get(targeted).is_err() {
-            state.targeted = None;
-        }
+    if let Some(targeted) = state.targeted
+        && targetables.get(targeted).is_err()
+    {
+        state.targeted = None;
     }
 
     state.hovered = None;
@@ -216,7 +216,7 @@ fn update_highlight_glow(
 }
 
 fn apply_highlight_emissive(
-    glows: Query<(Entity, &HighlightGlow)>,
+    glows: Query<(Entity, &HighlightGlow), Changed<HighlightGlow>>,
     children_query: Query<&Children>,
     material_query: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -227,10 +227,10 @@ fn apply_highlight_emissive(
 
         let mut stack = vec![entity];
         while let Some(current) = stack.pop() {
-            if let Ok(mat_handle) = material_query.get(current) {
-                if let Some(mat) = materials.get_mut(&mat_handle.0) {
-                    mat.emissive = emissive;
-                }
+            if let Ok(mat_handle) = material_query.get(current)
+                && let Some(mat) = materials.get_mut(&mat_handle.0)
+            {
+                mat.emissive = emissive;
             }
             if let Ok(children) = children_query.get(current) {
                 for &child in children.iter() {
@@ -244,29 +244,18 @@ fn apply_highlight_emissive(
 fn update_target_ui(
     state: Res<TargetState>,
     targetables: Query<(&Targetable, &HitPoints, &StunMeter)>,
-    mut panel_vis: Query<&mut Visibility, With<TargetPanel>>,
-    mut text_query: Query<&mut Text, With<TargetNameText>>,
-    mut hp_fill: Query<&mut Node, (With<TargetHpFill>, Without<TargetStunFill>)>,
-    mut stun_fill: Query<&mut Node, (With<TargetStunFill>, Without<TargetHpFill>)>,
+    mut panel_vis: Single<&mut Visibility, With<TargetPanel>>,
+    mut text: Single<&mut Text, With<TargetNameText>>,
+    mut hp_fill: Single<&mut Node, (With<TargetHpFill>, Without<TargetStunFill>)>,
+    mut stun_fill: Single<&mut Node, (With<TargetStunFill>, Without<TargetHpFill>)>,
 ) {
     let display_entity = state.hovered.or(state.targeted);
 
     let show = if let Some(entity) = display_entity {
         if let Ok((targetable, hp, stun)) = targetables.get(entity) {
-            if let Ok(mut text) = text_query.get_single_mut() {
-                text.0 = targetable.name.clone();
-            }
-            let max_hp = match targetable.name.as_str() {
-                "Demon Rat" => 8.0,
-                "Goblin Archer" => 6.0,
-                _ => 10.0,
-            };
-            if let Ok(mut node) = hp_fill.get_single_mut() {
-                node.width = Val::Percent((hp.current as f32 / max_hp).clamp(0.0, 1.0) * 100.0);
-            }
-            if let Ok(mut node) = stun_fill.get_single_mut() {
-                node.width = Val::Percent((1.0 - stun.fraction()).clamp(0.0, 1.0) * 100.0);
-            }
+            text.0 = targetable.name.clone();
+            hp_fill.width = Val::Percent(hp.fraction().clamp(0.0, 1.0) * 100.0);
+            stun_fill.width = Val::Percent((1.0 - stun.fraction()).clamp(0.0, 1.0) * 100.0);
             true
         } else {
             false
@@ -275,11 +264,9 @@ fn update_target_ui(
         false
     };
 
-    if let Ok(mut vis) = panel_vis.get_single_mut() {
-        *vis = if show {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
-    }
+    **panel_vis = if show {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
 }

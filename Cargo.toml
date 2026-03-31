@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+smallvec = "1"
 bevy = { version = "0.15", default-features = false, features = [
     "bevy_asset",
     "bevy_winit",
@@ -16,6 +17,7 @@ bevy = { version = "0.15", default-features = false, features = [
     "bevy_text",
     "bevy_ui",
     "default_font",
+    "bevy_audio",
     "x11",
     "png",
 ] }

@@ -1,8 +1,10 @@
 use bevy::prelude::*;
 
-use crate::combat::{GameOver, HitPoints};
+use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
-use crate::player::{DeathAnim, Dodge, MoveTarget, Player, PlayerCombat, PlayerStats};
+use crate::player::{
+    DeathAnim, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats,
+};
 use crate::targeting::TargetState;
 use crate::world::tilemap::grid_to_world;
 
@@ -91,7 +93,7 @@ fn update_hud(
 
     for (bar, mut node) in &mut fills {
         let pct = match bar.0 {
-            BarKind::Health => hp.current as f32 / 20.0,
+            BarKind::Health => hp.fraction(),
             BarKind::Stamina => stats.stamina / stats.max_stamina,
             BarKind::Mana => stats.mana / stats.max_mana,
         };
@@ -108,6 +110,31 @@ struct DeathScreen;
 
 #[derive(Component)]
 struct RestartButton;
+
+type RestartButtonInteractions<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Interaction, &'static mut BackgroundColor),
+    (Changed<Interaction>, With<RestartButton>),
+>;
+
+type RestartPlayer<'w> = Option<
+    Single<
+        'w,
+        (
+            &'static mut Transform,
+            &'static mut HitPoints,
+            &'static mut PlayerStats,
+            &'static mut PlayerCombat,
+            &'static mut Dodge,
+            &'static mut MoveTarget,
+            &'static mut DeathAnim,
+            &'static mut KnightAnimator,
+            &'static mut HitFlash,
+        ),
+        With<Player>,
+    >,
+>;
 
 fn spawn_death_screen(mut commands: Commands) {
     commands
@@ -188,25 +215,9 @@ fn check_death(
 
 fn handle_restart_click(
     mut game_over: ResMut<GameOver>,
-    mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<RestartButton>),
-    >,
+    mut interaction_query: RestartButtonInteractions<'_, '_>,
     mut death_screen: Query<&mut Visibility, With<DeathScreen>>,
-    mut player: Option<
-        Single<
-            (
-                &mut Transform,
-                &mut HitPoints,
-                &mut PlayerStats,
-                &mut PlayerCombat,
-                &mut Dodge,
-                &mut MoveTarget,
-                &mut DeathAnim,
-            ),
-            With<Player>,
-        >,
-    >,
+    mut player: RestartPlayer<'_>,
     mut target_state: ResMut<TargetState>,
     mut respawn_event: EventWriter<RespawnEnemies>,
 ) {
@@ -226,13 +237,26 @@ fn handle_restart_click(
 
                 // Reset player
                 if let Some(ref mut p) = player {
-                    let (ref mut tf, ref mut hp, ref mut stats, ref mut combat, ref mut dodge, ref mut move_target, ref mut death_anim) = **p;
+                    let (
+                        ref mut tf,
+                        ref mut hp,
+                        ref mut stats,
+                        ref mut combat,
+                        ref mut dodge,
+                        ref mut move_target,
+                        ref mut death_anim,
+                        ref mut animator,
+                        ref mut flash,
+                    ) = **p;
                     tf.translation = grid_to_world(10, 10);
-                    **hp = HitPoints::new(20);
+                    tf.rotation = Quat::IDENTITY;
+                    hp.current = hp.max;
                     **stats = PlayerStats::default();
                     **combat = PlayerCombat::default();
                     **dodge = Dodge::default();
                     **death_anim = DeathAnim::default();
+                    **animator = KnightAnimator::default();
+                    **flash = HitFlash::default();
                     move_target.position = None;
                 }
 

@@ -34,7 +34,7 @@ pub struct DebugPlugin;
 
 impl Plugin for DebugPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(FrameTimeDiagnosticsPlugin::default())
+        app.add_plugins(FrameTimeDiagnosticsPlugin)
             .insert_resource(PerfLog {
                 worst_fps: f64::MAX,
                 worst_frame_ms: 0.0,
@@ -42,15 +42,10 @@ impl Plugin for DebugPlugin {
                 cooldown: Timer::from_seconds(DIP_LOG_COOLDOWN_SECS, TimerMode::Once),
             })
             .insert_resource(FileLogger::new())
-            .insert_resource(EntityCount(0))
             .add_systems(Startup, (spawn_debug_overlay, log_render_adapter_info))
             .add_systems(
                 Update,
-                (
-                    count_entities,
-                    (update_debug_overlay, log_perf_dips, write_debug_to_file),
-                )
-                    .chain(),
+                (update_debug_overlay, log_perf_dips, write_debug_to_file).chain(),
             );
     }
 }
@@ -166,13 +161,6 @@ fn log_render_adapter_info(adapter_info: Res<RenderAdapterInfo>, file_logger: Re
     file_logger.write_line(&format!("[GPU] {:?}", &**adapter_info));
 }
 
-#[derive(Resource)]
-struct EntityCount(usize);
-
-fn count_entities(entities: Query<Entity>, mut count: ResMut<EntityCount>) {
-    count.0 = entities.iter().len();
-}
-
 #[derive(Component)]
 struct DebugOverlayText;
 
@@ -213,9 +201,9 @@ fn update_debug_overlay(
 
 fn log_perf_dips(
     mut perf_log: ResMut<PerfLog>,
-    entity_count: Res<EntityCount>,
     time: Res<Time>,
     file_logger: Res<FileLogger>,
+    entities: Query<Entity>,
 ) {
     perf_log.cooldown.tick(time.delta());
 
@@ -237,9 +225,10 @@ fn log_perf_dips(
     if (fps < FPS_DIP_THRESHOLD || frame_ms > FRAME_TIME_SPIKE_MS) && perf_log.cooldown.finished() {
         perf_log.dip_count += 1;
         perf_log.cooldown.reset();
+        let entity_count = entities.iter().count();
         let msg = format!(
             "PERF DIP #{}: fps={:.1}, frame={:.1}ms, entities={}",
-            perf_log.dip_count, fps, frame_ms, entity_count.0
+            perf_log.dip_count, fps, frame_ms, entity_count
         );
         warn!("{msg}");
         file_logger.write_line(&format!("[PERF] {msg}"));
@@ -250,7 +239,7 @@ fn write_debug_to_file(
     mut file_logger: ResMut<FileLogger>,
     time: Res<Time>,
     perf_log: Res<PerfLog>,
-    entity_count: Res<EntityCount>,
+    entities: Query<Entity>,
     player: Option<Single<(&Transform, &MoveTarget), With<Player>>>,
     camera: Option<Single<(&Transform, &Projection), With<MainCamera>>>,
 ) {
@@ -260,6 +249,7 @@ fn write_debug_to_file(
         return;
     }
 
+    let entity_count = entities.iter().count();
     let elapsed = time.elapsed_secs();
     let delta_secs = time.delta_secs_f64();
     let fps = if delta_secs > 0.0 {
@@ -305,7 +295,7 @@ fn write_debug_to_file(
         "[{elapsed:>8.1}s] frame={} fps={fps:.0} dt={frame_ms:.1}ms ent={} \
          worst_fps={:.0} worst_dt={:.1}ms dips={} | player: {player_info} | cam: {cam_info}",
         file_logger.frame_count,
-        entity_count.0,
+        entity_count,
         if perf_log.worst_fps == f64::MAX {
             0.0
         } else {

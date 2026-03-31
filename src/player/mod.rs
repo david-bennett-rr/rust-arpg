@@ -3,9 +3,11 @@ use std::f32::consts::PI;
 use bevy::prelude::*;
 
 use crate::camera::MainCamera;
-use crate::combat::{FlashTint, HitFlash, HitPoints, game_running};
+use crate::combat::{FlashTint, HitFlash, HitPoints, game_running, smoothstep01};
 use crate::targeting::{TargetState, Targetable};
-use crate::world::tilemap::grid_to_world;
+use crate::world::tilemap::{
+    clamp_ground_target_to_arena, clamp_translation_to_arena, grid_to_world,
+};
 
 pub struct PlayerPlugin;
 
@@ -33,7 +35,7 @@ impl Plugin for PlayerPlugin {
                     .run_if(game_running)
                     .in_set(PlayerSet::Update),
             )
-            .add_systems(Update, animate_death);
+            .add_systems(Update, animate_death.after(PlayerSet::Update));
     }
 }
 
@@ -44,6 +46,19 @@ pub struct Player;
 pub struct MoveTarget {
     pub position: Option<Vec2>,
 }
+
+type DodgePlayer<'w> = Single<
+    'w,
+    (
+        &'static Transform,
+        &'static mut Dodge,
+        &'static mut MoveTarget,
+        &'static mut PlayerStats,
+        &'static mut KnightAnimator,
+        &'static mut PlayerCombat,
+    ),
+    With<Player>,
+>;
 
 #[derive(Component, Default)]
 pub struct PlayerCombat {
@@ -127,7 +142,7 @@ impl Default for DeathAnim {
 }
 
 #[derive(Component)]
-struct KnightAnimator {
+pub(crate) struct KnightAnimator {
     walk_phase: f32,
     swing_timer: Timer,
 }
@@ -138,6 +153,27 @@ impl Default for KnightAnimator {
             walk_phase: 0.0,
             swing_timer: Timer::from_seconds(0.75, TimerMode::Once),
         }
+    }
+}
+
+impl KnightAnimator {
+    fn cancel_swing(&mut self) {
+        self.swing_timer.set_elapsed(self.swing_timer.duration());
+    }
+}
+
+#[derive(Default)]
+struct AttackIntent {
+    pending_strike: bool,
+    holding: bool,
+    windup: f32,
+}
+
+impl AttackIntent {
+    fn clear(&mut self) {
+        self.pending_strike = false;
+        self.holding = false;
+        self.windup = 0.0;
     }
 }
 
@@ -168,9 +204,10 @@ enum KnightJoint {
     Sword,
 }
 
+pub const PLAYER_COLLISION_RADIUS: f32 = 0.78;
 const MOVE_SPEED: f32 = 8.0;
 const ARRIVE_THRESHOLD: f32 = 0.15;
-const PLAYER_MAX_HP: i32 = 20;
+pub const PLAYER_MAX_HP: i32 = 20;
 const ATTACK_RANGE: f32 = 2.3;
 const ATTACK_WINDUP: f32 = 0.25;
 const DODGE_DURATION: f32 = 0.25;
@@ -544,10 +581,14 @@ fn handle_left_click(
     mut target_state: ResMut<TargetState>,
 ) {
     // Click on enemy: set target
-    if mouse_buttons.just_pressed(MouseButton::Left) && target_state.hovered.is_some() {
-        target_state.targeted = target_state.hovered;
-        player.position = None;
-        return;
+    if mouse_buttons.just_pressed(MouseButton::Left) {
+        if let Some(hovered) = target_state.hovered {
+            target_state.targeted = Some(hovered);
+            player.position = None;
+            return;
+        }
+
+        target_state.targeted = None;
     }
 
     // Hold on ground: continuously move toward cursor
@@ -573,7 +614,10 @@ fn handle_left_click(
     };
 
     let point = ray.get_point(distance);
-    player.position = Some(Vec2::new(point.x, point.z));
+    player.position = Some(clamp_ground_target_to_arena(
+        Vec2::new(point.x, point.z),
+        PLAYER_COLLISION_RADIUS,
+    ));
 }
 
 fn chase_and_attack_target(
@@ -590,31 +634,25 @@ fn chase_and_attack_target(
         ),
         With<Player>,
     >,
-    mut pending_strike: Local<bool>,
-    mut holding: Local<bool>,
-    mut windup: Local<f32>,
+    mut attack_intent: Local<AttackIntent>,
     time: Res<Time>,
 ) {
     let Some(target_entity) = target_state.targeted else {
-        *pending_strike = false;
-        *holding = false;
-        *windup = 0.0;
+        attack_intent.clear();
         return;
     };
     let Ok(target_tf) = target_transforms.get(target_entity) else {
-        *pending_strike = false;
-        *holding = false;
-        *windup = 0.0;
+        attack_intent.clear();
         return;
     };
 
     // Click sets a pending strike that survives the walk; hold = continuous
     if mouse_buttons.just_pressed(MouseButton::Left) {
-        *pending_strike = true;
-        *holding = true;
+        attack_intent.pending_strike = true;
+        attack_intent.holding = true;
     }
     if !mouse_buttons.pressed(MouseButton::Left) {
-        *holding = false;
+        attack_intent.holding = false;
     }
 
     let (ref mut player_tf, ref mut move_target, ref mut animator, ref mut combat, ref mut stats) =
@@ -632,13 +670,16 @@ fn chase_and_attack_target(
         player_tf.look_to(-to_target.normalize(), Vec3::Y);
     }
 
-    let can_attack = *pending_strike || *holding;
+    let can_attack = attack_intent.pending_strike || attack_intent.holding;
 
     if distance > ATTACK_RANGE {
         // Chase: move toward the target, keep winding up if close-ish
-        move_target.position = Some(Vec2::new(target_pos.x, target_pos.z));
+        move_target.position = Some(clamp_ground_target_to_arena(
+            Vec2::new(target_pos.x, target_pos.z),
+            PLAYER_COLLISION_RADIUS,
+        ));
         if !can_attack || distance > ATTACK_RANGE * 1.5 {
-            *windup = 0.0;
+            attack_intent.windup = 0.0;
         }
     } else {
         // In range: stop and plant feet
@@ -646,25 +687,35 @@ fn chase_and_attack_target(
     }
 
     if can_attack && animator.swing_timer.finished() {
-        *windup += time.delta_secs();
-        if *windup >= ATTACK_WINDUP && distance <= ATTACK_RANGE && stats.spend_stamina(ATTACK_STAMINA_COST) {
-            *pending_strike = false;
-            *windup = 0.0;
+        attack_intent.windup += time.delta_secs();
+        if attack_intent.windup >= ATTACK_WINDUP
+            && distance <= ATTACK_RANGE
+            && stats.spend_stamina(ATTACK_STAMINA_COST)
+        {
+            attack_intent.pending_strike = false;
+            attack_intent.windup = 0.0;
             animator.swing_timer.reset();
             combat.swing_id = combat.swing_id.wrapping_add(1);
             combat.strike = 0.0;
         }
     } else if !can_attack {
-        *windup = 0.0;
+        attack_intent.windup = 0.0;
     }
 }
 
 fn trigger_dodge(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut player: Single<(&Transform, &mut Dodge, &mut MoveTarget, &mut PlayerStats), With<Player>>,
+    mut player: DodgePlayer<'_>,
     mut target_state: ResMut<TargetState>,
 ) {
-    let (player_tf, ref mut dodge, ref mut move_target, ref mut stats) = *player;
+    let (
+        player_tf,
+        ref mut dodge,
+        ref mut move_target,
+        ref mut stats,
+        ref mut animator,
+        ref mut combat,
+    ) = *player;
 
     if !keyboard.just_pressed(KeyCode::Space) || !dodge.cooldown.finished() || dodge.active {
         return;
@@ -688,14 +739,13 @@ fn trigger_dodge(
     dodge.cooldown.reset();
 
     // Cancel current actions
+    animator.cancel_swing();
+    combat.strike = 0.0;
     move_target.position = None;
     target_state.targeted = None;
 }
 
-fn update_dodge(
-    time: Res<Time>,
-    mut player: Single<(&mut Transform, &mut Dodge), With<Player>>,
-) {
+fn update_dodge(time: Res<Time>, mut player: Single<(&mut Transform, &mut Dodge), With<Player>>) {
     let (ref mut player_tf, ref mut dodge) = *player;
 
     dodge.timer.tick(time.delta());
@@ -713,12 +763,14 @@ fn update_dodge(
     // Move in dodge direction
     let step = DODGE_SPEED * time.delta_secs();
     player_tf.translation += dodge.direction * step;
+    clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
 }
 
 fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats, With<Player>>) {
     player.regen_delay.tick(time.delta());
     if player.regen_delay.finished() && player.stamina < player.max_stamina {
-        player.stamina = (player.stamina + STAMINA_REGEN * time.delta_secs()).min(player.max_stamina);
+        player.stamina =
+            (player.stamina + STAMINA_REGEN * time.delta_secs()).min(player.max_stamina);
     }
 }
 
@@ -762,19 +814,23 @@ fn move_player(
         player_tf.translation.x += direction.x * step_mag;
         player_tf.translation.z += direction.y * step_mag;
     }
+
+    clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
 }
 
 fn animate_knight(
     time: Res<Time>,
-    mut player: Single<
-        (&MoveTarget, &Dodge, &mut KnightAnimator, &mut PlayerCombat),
-        With<Player>,
-    >,
+    mut player: Single<(&MoveTarget, &Dodge, &mut KnightAnimator, &mut PlayerCombat), With<Player>>,
     mut joints: Query<(&KnightJoint, &JointRest, &mut Transform)>,
 ) {
     let (move_target, dodge, ref mut animator, ref mut combat) = *player;
 
-    animator.swing_timer.tick(time.delta());
+    if dodge.active {
+        animator.cancel_swing();
+        combat.strike = 0.0;
+    } else {
+        animator.swing_timer.tick(time.delta());
+    }
 
     if move_target.position.is_some() {
         animator.walk_phase += time.delta_secs() * 8.0;
@@ -791,7 +847,11 @@ fn animate_knight(
     } else {
         0.0
     };
-    let sword_swing = sword_swing_curve(&animator.swing_timer);
+    let sword_swing = if dodge.active {
+        0.0
+    } else {
+        sword_swing_curve(&animator.swing_timer)
+    };
     let sword_windup = (-sword_swing).max(0.0);
     let sword_strike = sword_swing.max(0.0);
     combat.strike = sword_strike;
@@ -970,26 +1030,21 @@ fn animate_death(
                 transform.rotation *= Quat::from_rotation_x(fall * 0.4);
             }
             KnightJoint::LeftArm => {
-                transform.rotation *= Quat::from_rotation_x(-fall * 0.6)
-                    * Quat::from_rotation_z(-fall * 0.3);
+                transform.rotation *=
+                    Quat::from_rotation_x(-fall * 0.6) * Quat::from_rotation_z(-fall * 0.3);
             }
             KnightJoint::RightArm => {
-                transform.rotation *= Quat::from_rotation_x(-fall * 0.8)
-                    * Quat::from_rotation_z(fall * 0.4);
+                transform.rotation *=
+                    Quat::from_rotation_x(-fall * 0.8) * Quat::from_rotation_z(fall * 0.4);
             }
             KnightJoint::Sword => {
                 // Sword drops away
-                transform.rotation *= Quat::from_rotation_x(-fall * 1.2)
-                    * Quat::from_rotation_z(fall * 0.6);
+                transform.rotation *=
+                    Quat::from_rotation_x(-fall * 1.2) * Quat::from_rotation_z(fall * 0.6);
             }
             _ => {}
         }
     }
-}
-
-fn smoothstep01(t: f32) -> f32 {
-    let x = t.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
 }
 
 pub fn visual_forward(transform: &Transform) -> Vec3 {

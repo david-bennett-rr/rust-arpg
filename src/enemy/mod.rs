@@ -1,14 +1,16 @@
-use std::{
-    f32::consts::PI,
-    time::{SystemTime, UNIX_EPOCH},
+use std::{collections::HashMap, f32::consts::PI};
+
+use bevy::{asset::AssetId, prelude::*};
+use smallvec::SmallVec;
+
+use crate::combat::{
+    DamageRng, FlashTint, HitFlash, HitPoints, StunMeter, game_running, smoothstep01,
 };
-
-use bevy::prelude::*;
-
-use crate::combat::{FlashTint, HitFlash, HitPoints, StunMeter, game_running};
-use crate::player::{Dodge, Player, PlayerCombat, PlayerSet, visual_forward};
+use crate::player::{
+    Dodge, PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerSet, visual_forward,
+};
 use crate::targeting::{HighlightGlow, Targetable};
-use crate::world::tilemap::{MAP_SIZE, TILE_SIZE, grid_to_world};
+use crate::world::tilemap::{clamp_translation_to_arena, grid_to_world};
 
 #[derive(Event)]
 pub struct RespawnEnemies;
@@ -18,27 +20,26 @@ pub struct EnemyPlugin;
 impl Plugin for EnemyPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<RespawnEnemies>()
+            .add_systems(PreUpdate, instance_enemy_materials)
             .add_systems(
                 Startup,
                 (spawn_demon_rats, setup_arrow_meshes, spawn_goblin_archers).chain(),
             )
             .add_systems(
-            Update,
-            (
-                update_demon_rats,
-                update_goblin_archers,
-                update_arrows,
-                animate_demon_rats,
-                resolve_actor_collisions,
+                Update,
+                (
+                    update_demon_rats,
+                    update_goblin_archers,
+                    update_arrows,
+                    animate_demon_rats,
+                    animate_goblin_archers,
+                    resolve_actor_collisions,
+                )
+                    .chain()
+                    .run_if(game_running)
+                    .after(PlayerSet::Update),
             )
-                .chain()
-                .run_if(game_running)
-                .after(PlayerSet::Update),
-        )
-        .add_systems(
-            Update,
-            handle_respawn_enemies,
-        );
+            .add_systems(Update, handle_respawn_enemies);
     }
 }
 
@@ -54,10 +55,13 @@ pub struct DemonRat {
     alerted: bool,
 }
 
+/// Per-enemy collision settings.
 #[derive(Component, Clone, Copy)]
 struct EnemyCollision {
     radius: f32,
-    player_push_ratio: f32,
+    /// Share of overlap correction applied to the player (0.0 = enemy absorbs
+    /// all push, 1.0 = player absorbs all push).
+    player_push_share: f32,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -102,6 +106,88 @@ pub struct Arrow {
     lifetime: f32,
 }
 
+#[derive(Component)]
+struct UniqueEnemyMaterials;
+
+type RatPlayer<'w> = Single<
+    'w,
+    (
+        &'static Transform,
+        &'static PlayerCombat,
+        &'static Dodge,
+        &'static mut HitPoints,
+        &'static mut HitFlash,
+    ),
+    (With<Player>, Without<DemonRat>),
+>;
+
+type RatActors<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut DemonRat,
+        &'static mut Transform,
+        &'static mut HitPoints,
+        &'static mut StunMeter,
+        &'static mut HitFlash,
+    ),
+    Without<Player>,
+>;
+
+type CollisionPlayer<'w> =
+    Single<'w, (&'static mut Transform, &'static Dodge), (With<Player>, Without<EnemyCollision>)>;
+
+type EnemyActors<'w, 's> = Query<
+    'w,
+    's,
+    (&'static EnemyCollision, &'static mut Transform),
+    (With<EnemyCollision>, Without<Player>),
+>;
+
+type GoblinPlayer<'w> =
+    Single<'w, (&'static Transform, &'static PlayerCombat), (With<Player>, Without<GoblinArcher>)>;
+
+type GoblinActors<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut GoblinArcher,
+        &'static mut Transform,
+        &'static mut HitPoints,
+        &'static mut StunMeter,
+        &'static mut HitFlash,
+    ),
+    Without<Player>,
+>;
+
+type ArrowPlayer<'w> = Single<
+    'w,
+    (
+        &'static Transform,
+        &'static Dodge,
+        &'static mut HitPoints,
+        &'static mut HitFlash,
+    ),
+    (With<Player>, Without<Arrow>),
+>;
+
+#[derive(Clone, Copy)]
+struct PlayerSlashState<'a> {
+    ground: Vec3,
+    forward: Vec3,
+    combat: &'a PlayerCombat,
+    ready: bool,
+}
+
+struct SlashTarget<'a> {
+    last_hit_swing_id: &'a mut u32,
+    health: &'a mut HitPoints,
+    stun: &'a mut StunMeter,
+    flash: &'a mut HitFlash,
+}
+
 const RAT_MOVE_SPEED: f32 = 3.25;
 const RAT_AGGRO_RANGE: f32 = 11.0;
 const RAT_ATTACK_RANGE: f32 = 1.5;
@@ -115,7 +201,6 @@ const RAT_BITE_REACH: f32 = 1.48;
 const RAT_HP: i32 = 8;
 const PLAYER_SLASH_RANGE: f32 = 2.5;
 const PLAYER_SLASH_ARC_DOT: f32 = 0.08;
-const PLAYER_COLLISION_RADIUS: f32 = 0.78;
 const RAT_COLLISION_RADIUS: f32 = 0.58;
 const COLLISION_EPSILON: f32 = 0.001;
 
@@ -134,6 +219,7 @@ const ARROW_SPEED: f32 = 6.0;
 const ARROW_DAMAGE: i32 = 2;
 const ARROW_LIFETIME: f32 = 4.0;
 const ARROW_HIT_RADIUS: f32 = 0.5;
+const ARROW_HIT_HEIGHT: f32 = 2.2;
 
 fn spawn_demon_rats(
     mut commands: Commands,
@@ -176,6 +262,32 @@ fn do_spawn_rats(
     let claw_mesh = meshes.add(Cuboid::new(0.08, 0.10, 0.18));
     let spine_mesh = meshes.add(Cone::new(0.10, 0.28).mesh().resolution(4));
 
+    let fur = materials.add(StandardMaterial {
+        base_color: Color::srgb(fur_color.x, fur_color.y, fur_color.z),
+        perceptual_roughness: 0.98,
+        ..default()
+    });
+    let dark_fur = materials.add(StandardMaterial {
+        base_color: Color::srgb(dark_fur_color.x, dark_fur_color.y, dark_fur_color.z),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let flesh = materials.add(StandardMaterial {
+        base_color: Color::srgb(flesh_color.x, flesh_color.y, flesh_color.z),
+        perceptual_roughness: 0.94,
+        ..default()
+    });
+    let eye = materials.add(StandardMaterial {
+        base_color: Color::srgb(eye_color.x, eye_color.y, eye_color.z),
+        perceptual_roughness: 0.65,
+        ..default()
+    });
+    let bone = materials.add(StandardMaterial {
+        base_color: Color::srgb(bone_color.x, bone_color.y, bone_color.z),
+        perceptual_roughness: 0.88,
+        ..default()
+    });
+
     let spawn_points = [
         grid_to_world(6, 8),
         grid_to_world(8, 14),
@@ -186,32 +298,6 @@ fn do_spawn_rats(
     ];
 
     for home in spawn_points {
-        let fur = materials.add(StandardMaterial {
-            base_color: Color::srgb(fur_color.x, fur_color.y, fur_color.z),
-            perceptual_roughness: 0.98,
-            ..default()
-        });
-        let dark_fur = materials.add(StandardMaterial {
-            base_color: Color::srgb(dark_fur_color.x, dark_fur_color.y, dark_fur_color.z),
-            perceptual_roughness: 1.0,
-            ..default()
-        });
-        let flesh = materials.add(StandardMaterial {
-            base_color: Color::srgb(flesh_color.x, flesh_color.y, flesh_color.z),
-            perceptual_roughness: 0.94,
-            ..default()
-        });
-        let eye = materials.add(StandardMaterial {
-            base_color: Color::srgb(eye_color.x, eye_color.y, eye_color.z),
-            perceptual_roughness: 0.65,
-            ..default()
-        });
-        let bone = materials.add(StandardMaterial {
-            base_color: Color::srgb(bone_color.x, bone_color.y, bone_color.z),
-            perceptual_roughness: 0.88,
-            ..default()
-        });
-
         let rat = commands
             .spawn((
                 DemonRat {
@@ -226,7 +312,7 @@ fn do_spawn_rats(
                 },
                 EnemyCollision {
                     radius: RAT_COLLISION_RADIUS,
-                    player_push_ratio: 0.0,
+                    player_push_share: 0.0,
                 },
                 Targetable {
                     name: "Demon Rat".into(),
@@ -236,6 +322,7 @@ fn do_spawn_rats(
                 HitPoints::new(RAT_HP),
                 StunMeter::new(4.0, 2.5, 1.5),
                 HitFlash::default(),
+                UniqueEnemyMaterials,
                 Transform::from_translation(home),
                 Visibility::Visible,
             ))
@@ -389,57 +476,42 @@ fn do_spawn_rats(
 fn update_demon_rats(
     mut commands: Commands,
     time: Res<Time>,
-    mut player: Single<
-        (&Transform, &PlayerCombat, &Dodge, &mut HitPoints, &mut HitFlash),
-        (With<Player>, Without<DemonRat>),
-    >,
-    mut rats: Query<
-        (
-            Entity,
-            &mut DemonRat,
-            &mut Transform,
-            &mut HitPoints,
-            &mut StunMeter,
-            &mut HitFlash,
-        ),
-        Without<Player>,
-    >,
-    mut damage_rng: Local<u64>,
+    mut player: RatPlayer<'_>,
+    mut rats: RatActors<'_, '_>,
+    mut damage_rng: ResMut<DamageRng>,
 ) {
     let delta = time.delta_secs();
-    let (player_transform, player_combat, player_dodge, ref mut player_health, ref mut player_flash) = *player;
-    let player_ground = Vec3::new(
-        player_transform.translation.x,
-        0.0,
-        player_transform.translation.z,
-    );
-    let player_forward = visual_forward(player_transform).normalize_or_zero();
-    let slash_ready = player_combat.strike > 0.42;
-
-    for (entity, mut rat, mut transform, ref mut rat_health, ref mut rat_stun, ref mut rat_flash) in &mut rats {
+    let (
+        player_transform,
+        player_combat,
+        player_dodge,
+        ref mut player_health,
+        ref mut player_flash,
+    ) = *player;
+    let player_slash = build_player_slash_state(player_transform, player_combat);
+    let player_ground = player_slash.ground;
+    for (entity, mut rat, mut transform, ref mut rat_health, ref mut rat_stun, ref mut rat_flash) in
+        &mut rats
+    {
         rat.attack_cooldown = (rat.attack_cooldown - delta).max(0.0);
         rat.chomp = (rat.chomp - delta / RAT_ATTACK_DURATION).max(0.0);
         transform.translation.y = 0.0;
 
         let rat_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
-        let to_rat = rat_ground - player_ground;
-        let rat_distance = to_rat.length();
-        if slash_ready && player_combat.swing_id != rat.last_hit_swing_id {
-            let rat_direction = to_rat.normalize_or_zero();
-            if rat_distance <= PLAYER_SLASH_RANGE
-                && rat_direction.dot(player_forward) >= PLAYER_SLASH_ARC_DOT
-            {
-                rat.last_hit_swing_id = player_combat.swing_id;
-                let damage = roll_1d5(&mut damage_rng);
-                if rat_health.apply_damage(damage) > 0 {
-                    rat_stun.apply_stun_damage(damage as f32);
-                    rat_flash.trigger();
-                    if rat_health.is_dead() {
-                        commands.entity(entity).despawn_recursive();
-                        continue;
-                    }
-                }
-            }
+        if try_player_slash(
+            &mut commands,
+            entity,
+            rat_ground,
+            SlashTarget {
+                last_hit_swing_id: &mut rat.last_hit_swing_id,
+                health: rat_health,
+                stun: rat_stun,
+                flash: rat_flash,
+            },
+            player_slash,
+            &mut damage_rng,
+        ) {
+            continue;
         }
 
         // Stunned — skip all AI
@@ -488,6 +560,7 @@ fn update_demon_rats(
             };
             let travel = step.min(remaining);
             transform.translation += move_direction * travel;
+            clamp_translation_to_arena(&mut transform.translation, RAT_COLLISION_RADIUS);
             transform.look_to(-move_direction, Vec3::Y);
             rat.gait_phase += delta * 12.0;
             rat.move_blend = 1.0;
@@ -504,10 +577,12 @@ fn update_demon_rats(
             let forward = transform.rotation * Vec3::Z;
             transform.translation.y = hop * RAT_HOP_HEIGHT;
             transform.translation += forward * lunge;
+            clamp_translation_to_arena(&mut transform.translation, RAT_COLLISION_RADIUS);
+            let bite_distance = horizontal_distance(player_ground, transform.translation);
 
             if !rat.attack_hit_applied
                 && attack_progress >= RAT_BITE_HIT_PROGRESS
-                && player_distance <= RAT_BITE_REACH
+                && bite_distance <= RAT_BITE_REACH
                 && !player_dodge.active
             {
                 rat.attack_hit_applied = true;
@@ -561,17 +636,73 @@ fn animate_demon_rats(
     }
 }
 
+fn animate_goblin_archers(time: Res<Time>, mut goblins: Query<(&GoblinArcher, &mut Transform)>) {
+    let t = time.elapsed_secs();
+    for (goblin, mut transform) in &mut goblins {
+        // Walking bob
+        if goblin.move_blend > 0.0 {
+            let bob = (goblin.gait_phase * 2.0).sin().abs() * 0.06;
+            transform.translation.y = bob;
+        }
+
+        // Draw bow lean
+        if goblin.draw_timer > 0.0 {
+            let draw_progress = 1.0 - (goblin.draw_timer / GOBLIN_DRAW_TIME);
+            transform.rotation *= Quat::from_rotation_x(smoothstep01(draw_progress) * 0.12);
+        }
+
+        // Idle sway when not alerted and standing still
+        if !goblin.alerted && goblin.move_blend == 0.0 {
+            let sway = (t * 0.8 + goblin.home.x * 0.3).sin() * 0.02;
+            transform.translation.y += sway.abs() * 0.03;
+            transform.rotation *= Quat::from_rotation_z(sway);
+        }
+    }
+}
+
+fn instance_enemy_materials(
+    roots: Query<Entity, Added<UniqueEnemyMaterials>>,
+    children_query: Query<&Children>,
+    mut material_query: Query<&mut MeshMaterial3d<StandardMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for root in &roots {
+        let mut stack = vec![root];
+        let mut cloned_handles: HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>> =
+            HashMap::new();
+
+        while let Some(entity) = stack.pop() {
+            if let Ok(mut material_handle) = material_query.get_mut(entity) {
+                let source_id = material_handle.0.id();
+                let cloned_handle = if let Some(existing) = cloned_handles.get(&source_id) {
+                    existing.clone()
+                } else {
+                    let Some(material) = materials.get(&material_handle.0).cloned() else {
+                        continue;
+                    };
+                    let cloned = materials.add(material);
+                    cloned_handles.insert(source_id, cloned.clone());
+                    cloned
+                };
+
+                material_handle.0 = cloned_handle;
+            }
+
+            if let Ok(children) = children_query.get(entity) {
+                stack.extend(children.iter().copied());
+            }
+        }
+    }
+}
+
 fn resolve_actor_collisions(
-    mut player: Single<(&mut Transform, &Dodge), (With<Player>, Without<EnemyCollision>)>,
+    mut player: CollisionPlayer<'_>,
     enemy_entities: Query<Entity, With<EnemyCollision>>,
-    mut enemy_transforms: Query<
-        (&EnemyCollision, &mut Transform),
-        (With<EnemyCollision>, Without<Player>),
-    >,
+    mut enemy_transforms: EnemyActors<'_, '_>,
 ) {
     let (ref mut player_tf, dodge) = *player;
     let mut player_ground = horizontal_position(player_tf.translation);
-    let enemy_ids: Vec<Entity> = enemy_entities.iter().collect();
+    let enemy_ids: SmallVec<[Entity; 16]> = enemy_entities.iter().collect();
 
     // Skip player-enemy collision while dodging
     if !dodge.active {
@@ -584,7 +715,7 @@ fn resolve_actor_collisions(
                 &mut player_ground,
                 &mut enemy_ground,
                 PLAYER_COLLISION_RADIUS + collision.radius,
-                collision.player_push_ratio,
+                collision.player_push_share,
             );
 
             if separation {
@@ -592,8 +723,8 @@ fn resolve_actor_collisions(
                 player_tf.translation.z = player_ground.y;
                 enemy_transform.translation.x = enemy_ground.x;
                 enemy_transform.translation.z = enemy_ground.y;
-                clamp_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
-                clamp_to_arena(&mut enemy_transform.translation, collision.radius);
+                clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+                clamp_translation_to_arena(&mut enemy_transform.translation, collision.radius);
                 player_ground = horizontal_position(player_tf.translation);
             }
         }
@@ -620,16 +751,56 @@ fn resolve_actor_collisions(
                 enemy_a.translation.z = a_ground.y;
                 enemy_b.translation.x = b_ground.x;
                 enemy_b.translation.z = b_ground.y;
-                clamp_to_arena(&mut enemy_a.translation, collision_a.radius);
-                clamp_to_arena(&mut enemy_b.translation, collision_b.radius);
+                clamp_translation_to_arena(&mut enemy_a.translation, collision_a.radius);
+                clamp_translation_to_arena(&mut enemy_b.translation, collision_b.radius);
             }
         }
     }
 }
 
-fn smoothstep01(t: f32) -> f32 {
-    let x = t.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
+fn build_player_slash_state<'a>(
+    transform: &Transform,
+    combat: &'a PlayerCombat,
+) -> PlayerSlashState<'a> {
+    let ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
+    let forward = visual_forward(transform).normalize_or_zero();
+    PlayerSlashState {
+        ground,
+        forward,
+        combat,
+        ready: combat.strike > 0.42,
+    }
+}
+
+/// Returns `true` if the entity was killed and despawned.
+fn try_player_slash(
+    commands: &mut Commands,
+    entity: Entity,
+    enemy_ground: Vec3,
+    target: SlashTarget<'_>,
+    player_slash: PlayerSlashState<'_>,
+    damage_rng: &mut DamageRng,
+) -> bool {
+    if !player_slash.ready || player_slash.combat.swing_id == *target.last_hit_swing_id {
+        return false;
+    }
+    let to_enemy = enemy_ground - player_slash.ground;
+    let distance = to_enemy.length();
+    let direction = to_enemy.normalize_or_zero();
+    if distance <= PLAYER_SLASH_RANGE && direction.dot(player_slash.forward) >= PLAYER_SLASH_ARC_DOT
+    {
+        *target.last_hit_swing_id = player_slash.combat.swing_id;
+        let damage = damage_rng.roll_1d5();
+        if target.health.apply_damage(damage) > 0 {
+            target.stun.apply_stun_damage(damage as f32);
+            target.flash.trigger();
+            if target.health.is_dead() {
+                commands.entity(entity).despawn_recursive();
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn rat_attack_progress(chomp: f32) -> Option<f32> {
@@ -653,6 +824,10 @@ fn horizontal_position(translation: Vec3) -> Vec2 {
     Vec2::new(translation.x, translation.z)
 }
 
+fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+    horizontal_position(a - b).length()
+}
+
 fn resolve_overlap(a: &mut Vec2, b: &mut Vec2, minimum_distance: f32, a_push_ratio: f32) -> bool {
     let offset = *b - *a;
     let distance = offset.length();
@@ -672,12 +847,6 @@ fn resolve_overlap(a: &mut Vec2, b: &mut Vec2, minimum_distance: f32, a_push_rat
     *a -= direction * a_push;
     *b += direction * b_push;
     true
-}
-
-fn clamp_to_arena(translation: &mut Vec3, radius: f32) {
-    let half_extent = (MAP_SIZE as f32 - 1.0) * TILE_SIZE * 0.5 - radius - 0.05;
-    translation.x = translation.x.clamp(-half_extent, half_extent);
-    translation.z = translation.z.clamp(-half_extent, half_extent);
 }
 
 // ---------------------------------------------------------------------------
@@ -719,10 +888,41 @@ fn do_spawn_goblins(
     let arm_mesh = meshes.add(Capsule3d::new(0.10, 0.50).mesh().longitudes(5).latitudes(4));
     let leg_mesh = meshes.add(Capsule3d::new(0.11, 0.52).mesh().longitudes(5).latitudes(4));
     // Bow pieces: upper limb, lower limb, grip, string
-    let bow_limb_mesh = meshes.add(Capsule3d::new(0.025, 0.38).mesh().longitudes(5).latitudes(4));
+    let bow_limb_mesh = meshes.add(
+        Capsule3d::new(0.025, 0.38)
+            .mesh()
+            .longitudes(5)
+            .latitudes(4),
+    );
     let bow_grip_mesh = meshes.add(Cylinder::new(0.035, 0.14).mesh().resolution(5));
     let bow_string_mesh = meshes.add(Cylinder::new(0.008, 0.80).mesh().resolution(4));
     let hat_mesh = meshes.add(Cone::new(0.28, 0.48).mesh().resolution(5));
+
+    let skin = materials.add(StandardMaterial {
+        base_color: Color::srgb(skin_color.x, skin_color.y, skin_color.z),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    let dark_skin = materials.add(StandardMaterial {
+        base_color: Color::srgb(dark_skin_color.x, dark_skin_color.y, dark_skin_color.z),
+        perceptual_roughness: 0.98,
+        ..default()
+    });
+    let cloth = materials.add(StandardMaterial {
+        base_color: Color::srgb(cloth_color.x, cloth_color.y, cloth_color.z),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let wood = materials.add(StandardMaterial {
+        base_color: Color::srgb(wood_color.x, wood_color.y, wood_color.z),
+        perceptual_roughness: 0.90,
+        ..default()
+    });
+    let eye_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(eye_color.x, eye_color.y, eye_color.z),
+        perceptual_roughness: 0.65,
+        ..default()
+    });
 
     let spawn_points = [
         grid_to_world(4, 5),
@@ -731,32 +931,6 @@ fn do_spawn_goblins(
     ];
 
     for home in spawn_points {
-        let skin = materials.add(StandardMaterial {
-            base_color: Color::srgb(skin_color.x, skin_color.y, skin_color.z),
-            perceptual_roughness: 0.95,
-            ..default()
-        });
-        let dark_skin = materials.add(StandardMaterial {
-            base_color: Color::srgb(dark_skin_color.x, dark_skin_color.y, dark_skin_color.z),
-            perceptual_roughness: 0.98,
-            ..default()
-        });
-        let cloth = materials.add(StandardMaterial {
-            base_color: Color::srgb(cloth_color.x, cloth_color.y, cloth_color.z),
-            perceptual_roughness: 1.0,
-            ..default()
-        });
-        let wood = materials.add(StandardMaterial {
-            base_color: Color::srgb(wood_color.x, wood_color.y, wood_color.z),
-            perceptual_roughness: 0.90,
-            ..default()
-        });
-        let eye_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(eye_color.x, eye_color.y, eye_color.z),
-            perceptual_roughness: 0.65,
-            ..default()
-        });
-
         let goblin = commands
             .spawn((
                 GoblinArcher {
@@ -770,7 +944,7 @@ fn do_spawn_goblins(
                 },
                 EnemyCollision {
                     radius: GOBLIN_COLLISION_RADIUS,
-                    player_push_ratio: 1.0,
+                    player_push_share: 1.0,
                 },
                 Targetable {
                     name: "Goblin Archer".into(),
@@ -780,6 +954,7 @@ fn do_spawn_goblins(
                 HitPoints::new(GOBLIN_HP),
                 StunMeter::new(3.0, 3.0, 1.2),
                 HitFlash::default(),
+                UniqueEnemyMaterials,
                 Transform::from_translation(home),
                 Visibility::Visible,
             ))
@@ -799,10 +974,7 @@ fn do_spawn_goblins(
 
             // Head
             parent
-                .spawn((
-                    Transform::from_xyz(0.0, 1.78, 0.0),
-                    Visibility::Inherited,
-                ))
+                .spawn((Transform::from_xyz(0.0, 1.78, 0.0), Visibility::Inherited))
                 .with_children(|head| {
                     head.spawn((
                         Mesh3d(head_mesh.clone()),
@@ -864,8 +1036,7 @@ fn do_spawn_goblins(
             parent.spawn((
                 Mesh3d(arm_mesh.clone()),
                 MeshMaterial3d(skin.clone()),
-                Transform::from_xyz(0.42, 1.20, 0.0)
-                    .with_rotation(Quat::from_rotation_z(-0.15)),
+                Transform::from_xyz(0.42, 1.20, 0.0).with_rotation(Quat::from_rotation_z(-0.15)),
             ));
 
             // Legs
@@ -922,63 +1093,45 @@ fn do_spawn_goblins(
 fn update_goblin_archers(
     mut commands: Commands,
     time: Res<Time>,
-    mut player: Single<
-        (&Transform, &PlayerCombat, &Dodge, &mut HitPoints, &mut HitFlash),
-        (With<Player>, Without<GoblinArcher>),
-    >,
-    mut goblins: Query<
-        (
-            Entity,
-            &mut GoblinArcher,
-            &mut Transform,
-            &mut HitPoints,
-            &mut StunMeter,
-            &mut HitFlash,
-        ),
-        Without<Player>,
-    >,
+    player: GoblinPlayer<'_>,
+    mut goblins: GoblinActors<'_, '_>,
     arrow_meshes: Res<ArrowMeshes>,
-    mut damage_rng: Local<u64>,
+    mut damage_rng: ResMut<DamageRng>,
 ) {
     let delta = time.delta_secs();
-    let (player_transform, player_combat, _player_dodge, ref mut _player_health, ref mut _player_flash) =
-        *player;
-    let player_ground = Vec3::new(
-        player_transform.translation.x,
-        0.0,
-        player_transform.translation.z,
-    );
-    let player_forward = visual_forward(player_transform).normalize_or_zero();
-    let slash_ready = player_combat.strike > 0.42;
+    let (player_transform, player_combat) = *player;
+    let player_slash = build_player_slash_state(player_transform, player_combat);
+    let player_ground = player_slash.ground;
 
-    for (entity, mut goblin, mut transform, ref mut goblin_health, ref mut goblin_stun, ref mut goblin_flash) in
-        &mut goblins
+    for (
+        entity,
+        mut goblin,
+        mut transform,
+        ref mut goblin_health,
+        ref mut goblin_stun,
+        ref mut goblin_flash,
+    ) in &mut goblins
     {
         goblin.shoot_cooldown = (goblin.shoot_cooldown - delta).max(0.0);
         transform.translation.y = 0.0;
 
-        let goblin_ground =
-            Vec3::new(transform.translation.x, 0.0, transform.translation.z);
+        let goblin_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
 
         // Take damage from player sword
-        let to_goblin = goblin_ground - player_ground;
-        let goblin_distance = to_goblin.length();
-        if slash_ready && player_combat.swing_id != goblin.last_hit_swing_id {
-            let goblin_direction = to_goblin.normalize_or_zero();
-            if goblin_distance <= PLAYER_SLASH_RANGE
-                && goblin_direction.dot(player_forward) >= PLAYER_SLASH_ARC_DOT
-            {
-                goblin.last_hit_swing_id = player_combat.swing_id;
-                let damage = roll_1d5(&mut damage_rng);
-                if goblin_health.apply_damage(damage) > 0 {
-                    goblin_stun.apply_stun_damage(damage as f32);
-                    goblin_flash.trigger();
-                    if goblin_health.is_dead() {
-                        commands.entity(entity).despawn_recursive();
-                        continue;
-                    }
-                }
-            }
+        if try_player_slash(
+            &mut commands,
+            entity,
+            goblin_ground,
+            SlashTarget {
+                last_hit_swing_id: &mut goblin.last_hit_swing_id,
+                health: goblin_health,
+                stun: goblin_stun,
+                flash: goblin_flash,
+            },
+            player_slash,
+            &mut damage_rng,
+        ) {
+            continue;
         }
 
         // Stunned — skip all AI
@@ -1050,6 +1203,7 @@ fn update_goblin_archers(
                     step.min(home_distance)
                 };
                 transform.translation += move_direction * travel;
+                clamp_translation_to_arena(&mut transform.translation, GOBLIN_COLLISION_RADIUS);
                 // Face movement direction (turns around when fleeing)
                 transform.look_to(-move_direction, Vec3::Y);
                 goblin.gait_phase += delta * 10.0;
@@ -1097,12 +1251,7 @@ fn setup_arrow_meshes(
     });
 }
 
-fn spawn_arrow(
-    commands: &mut Commands,
-    meshes: &ArrowMeshes,
-    position: Vec3,
-    direction: Vec3,
-) {
+fn spawn_arrow(commands: &mut Commands, meshes: &ArrowMeshes, position: Vec3, direction: Vec3) {
     let rotation = Quat::from_rotation_arc(Vec3::Z, direction.normalize_or_zero());
 
     commands
@@ -1125,8 +1274,7 @@ fn spawn_arrow(
             parent.spawn((
                 Mesh3d(meshes.head.clone()),
                 MeshMaterial3d(meshes.head_material.clone()),
-                Transform::from_xyz(0.0, 0.0, 0.35)
-                    .with_rotation(Quat::from_rotation_x(PI / 2.0)),
+                Transform::from_xyz(0.0, 0.0, 0.35).with_rotation(Quat::from_rotation_x(PI / 2.0)),
             ));
         });
 }
@@ -1134,10 +1282,7 @@ fn spawn_arrow(
 fn update_arrows(
     mut commands: Commands,
     time: Res<Time>,
-    mut player: Single<
-        (&Transform, &Dodge, &mut HitPoints, &mut HitFlash),
-        (With<Player>, Without<Arrow>),
-    >,
+    mut player: ArrowPlayer<'_>,
     mut arrows: Query<(Entity, &mut Arrow, &mut Transform), Without<Player>>,
 ) {
     let delta = time.delta_secs();
@@ -1162,7 +1307,11 @@ fn update_arrows(
         );
         let distance = to_player.length();
 
-        if distance <= ARROW_HIT_RADIUS && !player_dodge.active {
+        let arrow_y = transform.translation.y;
+        if distance <= ARROW_HIT_RADIUS
+            && (0.0..=ARROW_HIT_HEIGHT).contains(&arrow_y)
+            && !player_dodge.active
+        {
             if player_health.apply_damage(ARROW_DAMAGE) > 0 {
                 player_flash.trigger();
             }
@@ -1180,13 +1329,10 @@ fn handle_respawn_enemies(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let mut triggered = false;
-    for _ in events.read() {
-        triggered = true;
-    }
-    if !triggered {
+    if events.is_empty() {
         return;
     }
+    events.clear();
 
     // Despawn all enemies and arrows
     for e in &rats {
@@ -1202,25 +1348,4 @@ fn handle_respawn_enemies(
     // Respawn — inline the spawn calls since we can't split ResMut
     do_spawn_rats(&mut commands, &mut meshes, &mut materials);
     do_spawn_goblins(&mut commands, &mut meshes, &mut materials);
-}
-
-fn roll_1d5(seed: &mut Local<u64>) -> i32 {
-    if **seed == 0 {
-        **seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or(0xA2F1_9C37_5D4B_E821);
-    }
-
-    let mut value = **seed;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-
-    if value == 0 {
-        value = 0x9E37_79B9_7F4A_7C15;
-    }
-
-    **seed = value;
-    ((value % 5) + 1) as i32
 }

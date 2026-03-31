@@ -3,6 +3,7 @@ use bevy::prelude::*;
 pub const MAP_SIZE: i32 = 20;
 pub const TILE_SIZE: f32 = 2.0;
 const TILE_HEIGHT: f32 = 0.24;
+const ARENA_EDGE_PADDING: f32 = 0.05;
 
 #[derive(Component)]
 pub struct FloorTile;
@@ -16,6 +17,24 @@ pub fn grid_to_world(grid_x: i32, grid_z: i32) -> Vec3 {
     )
 }
 
+pub fn arena_half_extent(radius: f32) -> f32 {
+    ((MAP_SIZE as f32 - 1.0) * TILE_SIZE * 0.5 - radius - ARENA_EDGE_PADDING).max(0.0)
+}
+
+pub fn clamp_ground_target_to_arena(target: Vec2, radius: f32) -> Vec2 {
+    let half_extent = arena_half_extent(radius);
+    Vec2::new(
+        target.x.clamp(-half_extent, half_extent),
+        target.y.clamp(-half_extent, half_extent),
+    )
+}
+
+pub fn clamp_translation_to_arena(translation: &mut Vec3, radius: f32) {
+    let half_extent = arena_half_extent(radius);
+    translation.x = translation.x.clamp(-half_extent, half_extent);
+    translation.z = translation.z.clamp(-half_extent, half_extent);
+}
+
 pub fn spawn_test_floor(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -24,7 +43,6 @@ pub fn spawn_test_floor(
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.72, 0.75, 0.84),
         brightness: 95.0,
-        ..default()
     });
 
     let tile_mesh = meshes.add(Cuboid::new(TILE_SIZE, TILE_HEIGHT, TILE_SIZE));
@@ -109,5 +127,18 @@ fn spawn_corner_obelisks(
             MeshMaterial3d(stone_material.clone()),
             Transform::from_translation(corner + Vec3::new(0.0, 3.65, 0.0)),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_ground_target_respects_arena_bounds() {
+        let half_extent = arena_half_extent(0.75);
+        let clamped = clamp_ground_target_to_arena(Vec2::new(999.0, -999.0), 0.75);
+
+        assert_eq!(clamped, Vec2::new(half_extent, -half_extent));
     }
 }
