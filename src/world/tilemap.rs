@@ -2,6 +2,7 @@ use bevy::prelude::*;
 
 pub const MAP_SIZE: i32 = 20;
 pub const TILE_SIZE: f32 = 2.0;
+pub const PLAYER_SPAWN_GRID: (i32, i32) = (10, 10);
 const TILE_HEIGHT: f32 = 0.24;
 const ARENA_EDGE_PADDING: f32 = 0.05;
 
@@ -61,12 +62,6 @@ pub fn spawn_test_floor(
         perceptual_roughness: 0.96,
         ..default()
     });
-    let stone_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.30, 0.29, 0.33),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-
     for grid_x in 0..MAP_SIZE {
         for grid_z in 0..MAP_SIZE {
             let material =
@@ -89,7 +84,7 @@ pub fn spawn_test_floor(
         }
     }
 
-    spawn_corner_obelisks(&mut commands, &mut meshes, stone_material);
+    spawn_corner_obelisks(&mut commands, &mut meshes, &mut materials);
 
     commands.spawn((
         DirectionalLight {
@@ -104,8 +99,13 @@ pub fn spawn_test_floor(
 fn spawn_corner_obelisks(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
-    stone_material: Handle<StandardMaterial>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
+    let stone_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.30, 0.29, 0.33),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
     let obelisk_mesh = meshes.add(Cuboid::new(1.0, 3.4, 1.0));
     let cap_mesh = meshes.add(Cuboid::new(1.3, 0.5, 1.3));
     let inset = 2;

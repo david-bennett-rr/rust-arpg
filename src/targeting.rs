@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 use crate::camera::MainCamera;
 use crate::combat::{HitPoints, StunMeter};
@@ -137,8 +138,8 @@ fn spawn_target_ui(mut commands: Commands) {
 }
 
 fn update_hover(
-    window: Single<&Window>,
-    camera_query: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
+    window: Option<Single<&Window, With<PrimaryWindow>>>,
+    camera_query: Option<Single<(&Camera, &GlobalTransform), With<MainCamera>>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     targetables: Query<(Entity, &GlobalTransform, &Targetable)>,
     mut state: ResMut<TargetState>,
@@ -155,6 +156,13 @@ fn update_hover(
     if keyboard.just_pressed(KeyCode::Escape) {
         state.targeted = None;
     }
+
+    let Some(window) = window else {
+        return;
+    };
+    let Some(camera_query) = camera_query else {
+        return;
+    };
 
     let Some(cursor_pos) = window.cursor_position() else {
         return;

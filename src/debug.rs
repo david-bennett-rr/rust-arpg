@@ -203,7 +203,6 @@ fn log_perf_dips(
     mut perf_log: ResMut<PerfLog>,
     time: Res<Time>,
     file_logger: Res<FileLogger>,
-    entities: Query<Entity>,
 ) {
     perf_log.cooldown.tick(time.delta());
 
@@ -225,10 +224,9 @@ fn log_perf_dips(
     if (fps < FPS_DIP_THRESHOLD || frame_ms > FRAME_TIME_SPIKE_MS) && perf_log.cooldown.finished() {
         perf_log.dip_count += 1;
         perf_log.cooldown.reset();
-        let entity_count = entities.iter().count();
         let msg = format!(
-            "PERF DIP #{}: fps={:.1}, frame={:.1}ms, entities={}",
-            perf_log.dip_count, fps, frame_ms, entity_count
+            "PERF DIP #{}: fps={:.1}, frame={:.1}ms",
+            perf_log.dip_count, fps, frame_ms
         );
         warn!("{msg}");
         file_logger.write_line(&format!("[PERF] {msg}"));

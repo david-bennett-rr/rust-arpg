@@ -6,7 +6,7 @@ use crate::player::{
     DeathAnim, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats,
 };
 use crate::targeting::TargetState;
-use crate::world::tilemap::grid_to_world;
+use crate::world::tilemap::{PLAYER_SPAWN_GRID, grid_to_world};
 
 const BAR_WIDTH: f32 = 220.0;
 const BAR_HEIGHT: f32 = 14.0;
@@ -248,7 +248,8 @@ fn handle_restart_click(
                         ref mut animator,
                         ref mut flash,
                     ) = **p;
-                    tf.translation = grid_to_world(10, 10);
+                    tf.translation =
+                        grid_to_world(PLAYER_SPAWN_GRID.0, PLAYER_SPAWN_GRID.1);
                     tf.rotation = Quat::IDENTITY;
                     hp.current = hp.max;
                     **stats = PlayerStats::default();
