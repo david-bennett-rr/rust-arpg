@@ -181,14 +181,14 @@ fn spawn_debug_overlay(mut commands: Commands) {
         DebugOverlayText,
         Text::new(""),
         TextFont {
-            font_size: 14.0,
+            font_size: 11.0,
             ..default()
         },
-        TextColor(Color::srgb(0.8, 0.8, 0.2)),
+        TextColor(Color::srgb(0.6, 0.6, 0.6)),
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(28.0),
-            left: Val::Px(8.0),
+            top: Val::Px(6.0),
+            right: Val::Px(8.0),
             ..default()
         },
     ));
@@ -196,8 +196,6 @@ fn spawn_debug_overlay(mut commands: Commands) {
 
 fn update_debug_overlay(
     diagnostics: Res<DiagnosticsStore>,
-    perf_log: Res<PerfLog>,
-    entity_count: Res<EntityCount>,
     mut text: Single<&mut Text, With<DebugOverlayText>>,
 ) {
     let frame_time_ms = diagnostics
@@ -205,10 +203,12 @@ fn update_debug_overlay(
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
 
-    text.0 = format!(
-        "entities: {} | frame: {:.1}ms | worst: {:.1}ms | dips: {}",
-        entity_count.0, frame_time_ms, perf_log.worst_frame_ms, perf_log.dip_count,
-    );
+    let fps = if frame_time_ms > 0.0 {
+        1000.0 / frame_time_ms
+    } else {
+        0.0
+    };
+    text.0 = format!("{fps:.0} fps");
 }
 
 fn log_perf_dips(

@@ -1,9 +1,10 @@
 use std::f32::consts::PI;
 
-use bevy::{input::common_conditions::input_just_pressed, prelude::*};
+use bevy::prelude::*;
 
 use crate::camera::MainCamera;
-use crate::combat::{FlashTint, HitFlash, HitPoints};
+use crate::combat::{FlashTint, HitFlash, HitPoints, game_running};
+use crate::targeting::{TargetState, Targetable};
 use crate::world::tilemap::grid_to_world;
 
 pub struct PlayerPlugin;
@@ -20,14 +21,19 @@ impl Plugin for PlayerPlugin {
             .add_systems(
                 Update,
                 (
-                    set_move_target_on_click.run_if(input_just_pressed(MouseButton::Left)),
-                    trigger_sword_swing,
+                    handle_left_click,
+                    chase_and_attack_target,
+                    trigger_dodge,
+                    update_dodge,
+                    regen_stamina,
                     move_player,
                     animate_knight,
                 )
                     .chain()
+                    .run_if(game_running)
                     .in_set(PlayerSet::Update),
-            );
+            )
+            .add_systems(Update, animate_death);
     }
 }
 
@@ -46,6 +52,81 @@ pub struct PlayerCombat {
 }
 
 #[derive(Component)]
+pub struct Dodge {
+    timer: Timer,
+    cooldown: Timer,
+    direction: Vec3,
+    pub active: bool,
+}
+
+impl Default for Dodge {
+    fn default() -> Self {
+        let mut cooldown = Timer::from_seconds(DODGE_COOLDOWN, TimerMode::Once);
+        cooldown.tick(std::time::Duration::from_secs_f32(DODGE_COOLDOWN));
+        let mut timer = Timer::from_seconds(DODGE_DURATION, TimerMode::Once);
+        timer.tick(std::time::Duration::from_secs_f32(DODGE_DURATION));
+        Self {
+            timer,
+            cooldown,
+            direction: Vec3::ZERO,
+            active: false,
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct PlayerStats {
+    pub stamina: f32,
+    pub max_stamina: f32,
+    pub mana: f32,
+    pub max_mana: f32,
+    regen_delay: Timer,
+}
+
+impl Default for PlayerStats {
+    fn default() -> Self {
+        let mut delay = Timer::from_seconds(STAMINA_REGEN_DELAY, TimerMode::Once);
+        delay.tick(std::time::Duration::from_secs_f32(STAMINA_REGEN_DELAY));
+        Self {
+            stamina: MAX_STAMINA,
+            max_stamina: MAX_STAMINA,
+            mana: MAX_MANA,
+            max_mana: MAX_MANA,
+            regen_delay: delay,
+        }
+    }
+}
+
+impl PlayerStats {
+    pub fn spend_stamina(&mut self, amount: f32) -> bool {
+        if self.stamina >= amount {
+            self.stamina -= amount;
+            self.regen_delay.reset();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+const DEATH_ANIM_DURATION: f32 = 1.2;
+
+#[derive(Component)]
+pub struct DeathAnim {
+    pub timer: Timer,
+    pub active: bool,
+}
+
+impl Default for DeathAnim {
+    fn default() -> Self {
+        Self {
+            timer: Timer::from_seconds(DEATH_ANIM_DURATION, TimerMode::Once),
+            active: false,
+        }
+    }
+}
+
+#[derive(Component)]
 struct KnightAnimator {
     walk_phase: f32,
     swing_timer: Timer,
@@ -55,7 +136,7 @@ impl Default for KnightAnimator {
     fn default() -> Self {
         Self {
             walk_phase: 0.0,
-            swing_timer: Timer::from_seconds(0.38, TimerMode::Once),
+            swing_timer: Timer::from_seconds(0.75, TimerMode::Once),
         }
     }
 }
@@ -90,6 +171,18 @@ enum KnightJoint {
 const MOVE_SPEED: f32 = 8.0;
 const ARRIVE_THRESHOLD: f32 = 0.15;
 const PLAYER_MAX_HP: i32 = 20;
+const ATTACK_RANGE: f32 = 2.3;
+const ATTACK_WINDUP: f32 = 0.25;
+const DODGE_DURATION: f32 = 0.25;
+const DODGE_COOLDOWN: f32 = 0.8;
+const DODGE_SPEED: f32 = 18.0;
+
+const MAX_STAMINA: f32 = 60.0;
+const MAX_MANA: f32 = 40.0;
+const STAMINA_REGEN: f32 = 18.0;
+const STAMINA_REGEN_DELAY: f32 = 0.6;
+const ATTACK_STAMINA_COST: f32 = 22.0;
+const DODGE_STAMINA_COST: f32 = 12.0;
 
 fn spawn_player(
     mut commands: Commands,
@@ -195,6 +288,9 @@ fn spawn_player(
             Player,
             MoveTarget { position: None },
             PlayerCombat::default(),
+            Dodge::default(),
+            PlayerStats::default(),
+            DeathAnim::default(),
             HitPoints::new(PLAYER_MAX_HP),
             HitFlash::default(),
             KnightAnimator::default(),
@@ -440,11 +536,30 @@ fn spawn_player(
     });
 }
 
-fn set_move_target_on_click(
+fn handle_left_click(
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window>,
     camera_query: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
-    mut move_target: Single<&mut MoveTarget, With<Player>>,
+    mut player: Single<&mut MoveTarget, With<Player>>,
+    mut target_state: ResMut<TargetState>,
 ) {
+    // Click on enemy: set target
+    if mouse_buttons.just_pressed(MouseButton::Left) && target_state.hovered.is_some() {
+        target_state.targeted = target_state.hovered;
+        player.position = None;
+        return;
+    }
+
+    // Hold on ground: continuously move toward cursor
+    if !mouse_buttons.pressed(MouseButton::Left) {
+        return;
+    }
+
+    // Don't override movement while chasing a target
+    if target_state.targeted.is_some() {
+        return;
+    }
+
     let Some(cursor_pos) = window.cursor_position() else {
         return;
     };
@@ -458,30 +573,166 @@ fn set_move_target_on_click(
     };
 
     let point = ray.get_point(distance);
-    move_target.position = Some(Vec2::new(point.x, point.z));
+    player.position = Some(Vec2::new(point.x, point.z));
 }
 
-fn trigger_sword_swing(
+fn chase_and_attack_target(
+    target_state: Res<TargetState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut player: Single<(&mut KnightAnimator, &mut PlayerCombat), With<Player>>,
+    target_transforms: Query<&GlobalTransform, With<Targetable>>,
+    mut player: Single<
+        (
+            &mut Transform,
+            &mut MoveTarget,
+            &mut KnightAnimator,
+            &mut PlayerCombat,
+            &mut PlayerStats,
+        ),
+        With<Player>,
+    >,
+    mut pending_strike: Local<bool>,
+    mut holding: Local<bool>,
+    mut windup: Local<f32>,
+    time: Res<Time>,
 ) {
-    let (ref mut animator, ref mut combat) = *player;
+    let Some(target_entity) = target_state.targeted else {
+        *pending_strike = false;
+        *holding = false;
+        *windup = 0.0;
+        return;
+    };
+    let Ok(target_tf) = target_transforms.get(target_entity) else {
+        *pending_strike = false;
+        *holding = false;
+        *windup = 0.0;
+        return;
+    };
 
-    if (mouse_buttons.just_pressed(MouseButton::Right) || keyboard.just_pressed(KeyCode::Space))
-        && animator.swing_timer.finished()
-    {
-        animator.swing_timer.reset();
-        combat.swing_id = combat.swing_id.wrapping_add(1);
-        combat.strike = 0.0;
+    // Click sets a pending strike that survives the walk; hold = continuous
+    if mouse_buttons.just_pressed(MouseButton::Left) {
+        *pending_strike = true;
+        *holding = true;
+    }
+    if !mouse_buttons.pressed(MouseButton::Left) {
+        *holding = false;
+    }
+
+    let (ref mut player_tf, ref mut move_target, ref mut animator, ref mut combat, ref mut stats) =
+        *player;
+    let target_pos = target_tf.translation();
+    let to_target = Vec3::new(
+        target_pos.x - player_tf.translation.x,
+        0.0,
+        target_pos.z - player_tf.translation.z,
+    );
+    let distance = to_target.length();
+
+    // Face the target
+    if distance > 0.001 {
+        player_tf.look_to(-to_target.normalize(), Vec3::Y);
+    }
+
+    let can_attack = *pending_strike || *holding;
+
+    if distance > ATTACK_RANGE {
+        // Chase: move toward the target, keep winding up if close-ish
+        move_target.position = Some(Vec2::new(target_pos.x, target_pos.z));
+        if !can_attack || distance > ATTACK_RANGE * 1.5 {
+            *windup = 0.0;
+        }
+    } else {
+        // In range: stop and plant feet
+        move_target.position = None;
+    }
+
+    if can_attack && animator.swing_timer.finished() {
+        *windup += time.delta_secs();
+        if *windup >= ATTACK_WINDUP && distance <= ATTACK_RANGE && stats.spend_stamina(ATTACK_STAMINA_COST) {
+            *pending_strike = false;
+            *windup = 0.0;
+            animator.swing_timer.reset();
+            combat.swing_id = combat.swing_id.wrapping_add(1);
+            combat.strike = 0.0;
+        }
+    } else if !can_attack {
+        *windup = 0.0;
+    }
+}
+
+fn trigger_dodge(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut player: Single<(&Transform, &mut Dodge, &mut MoveTarget, &mut PlayerStats), With<Player>>,
+    mut target_state: ResMut<TargetState>,
+) {
+    let (player_tf, ref mut dodge, ref mut move_target, ref mut stats) = *player;
+
+    if !keyboard.just_pressed(KeyCode::Space) || !dodge.cooldown.finished() || dodge.active {
+        return;
+    }
+
+    if !stats.spend_stamina(DODGE_STAMINA_COST) {
+        return;
+    }
+
+    // Dodge in current facing direction
+    let forward = visual_forward(player_tf).normalize_or_zero();
+    let direction = if forward.length_squared() > 0.001 {
+        Vec3::new(forward.x, 0.0, forward.z).normalize()
+    } else {
+        Vec3::Z
+    };
+
+    dodge.active = true;
+    dodge.direction = direction;
+    dodge.timer.reset();
+    dodge.cooldown.reset();
+
+    // Cancel current actions
+    move_target.position = None;
+    target_state.targeted = None;
+}
+
+fn update_dodge(
+    time: Res<Time>,
+    mut player: Single<(&mut Transform, &mut Dodge), With<Player>>,
+) {
+    let (ref mut player_tf, ref mut dodge) = *player;
+
+    dodge.timer.tick(time.delta());
+    dodge.cooldown.tick(time.delta());
+
+    if !dodge.active {
+        return;
+    }
+
+    if dodge.timer.finished() {
+        dodge.active = false;
+        return;
+    }
+
+    // Move in dodge direction
+    let step = DODGE_SPEED * time.delta_secs();
+    player_tf.translation += dodge.direction * step;
+}
+
+fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats, With<Player>>) {
+    player.regen_delay.tick(time.delta());
+    if player.regen_delay.finished() && player.stamina < player.max_stamina {
+        player.stamina = (player.stamina + STAMINA_REGEN * time.delta_secs()).min(player.max_stamina);
     }
 }
 
 fn move_player(
-    mut player_query: Single<(&mut Transform, &mut MoveTarget), With<Player>>,
+    mut player_query: Single<(&mut Transform, &mut MoveTarget, &Dodge), With<Player>>,
     time: Res<Time>,
 ) {
-    let (ref mut player_tf, ref mut move_target) = *player_query;
+    let (ref mut player_tf, ref mut move_target, dodge) = *player_query;
+
+    // Don't move normally during dodge
+    if dodge.active {
+        return;
+    }
+
     let Some(target_position) = move_target.position else {
         return;
     };
@@ -515,10 +766,13 @@ fn move_player(
 
 fn animate_knight(
     time: Res<Time>,
-    mut player: Single<(&MoveTarget, &mut KnightAnimator, &mut PlayerCombat), With<Player>>,
+    mut player: Single<
+        (&MoveTarget, &Dodge, &mut KnightAnimator, &mut PlayerCombat),
+        With<Player>,
+    >,
     mut joints: Query<(&KnightJoint, &JointRest, &mut Transform)>,
 ) {
-    let (move_target, ref mut animator, ref mut combat) = *player;
+    let (move_target, dodge, ref mut animator, ref mut combat) = *player;
 
     animator.swing_timer.tick(time.delta());
 
@@ -542,9 +796,65 @@ fn animate_knight(
     let sword_strike = sword_swing.max(0.0);
     combat.strike = sword_strike;
 
+    // Dodge roll: 0.0 → 1.0 over DODGE_DURATION
+    let dodge_t = if dodge.active {
+        let elapsed = dodge.timer.elapsed_secs();
+        let duration = dodge.timer.duration().as_secs_f32().max(0.001);
+        (elapsed / duration).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // Full forward tumble: smoothstep for natural acceleration/deceleration
+    let roll_angle = if dodge.active {
+        smoothstep01(dodge_t) * PI * 2.0
+    } else {
+        0.0
+    };
+    // Drop hips low during the middle of the roll
+    let roll_crouch = if dodge.active {
+        (dodge_t * PI).sin() * 0.55
+    } else {
+        0.0
+    };
+    // Tuck limbs during roll
+    let roll_tuck = if dodge.active {
+        (dodge_t * PI).sin()
+    } else {
+        0.0
+    };
+
     for (joint, rest, mut transform) in &mut joints {
         transform.translation = rest.translation;
         transform.rotation = rest.rotation;
+
+        if dodge.active {
+            match joint {
+                KnightJoint::Hips => {
+                    transform.translation.y -= roll_crouch;
+                    transform.rotation *= Quat::from_rotation_x(roll_angle);
+                }
+                KnightJoint::Chest => {}
+                KnightJoint::Head => {
+                    transform.rotation *= Quat::from_rotation_x(-roll_tuck * 0.6);
+                }
+                KnightJoint::LeftArm => {
+                    transform.rotation *= Quat::from_rotation_x(roll_tuck * 1.2)
+                        * Quat::from_rotation_z(-roll_tuck * 0.3);
+                }
+                KnightJoint::RightArm => {
+                    transform.rotation *= Quat::from_rotation_x(roll_tuck * 1.2)
+                        * Quat::from_rotation_z(roll_tuck * 0.3);
+                }
+                KnightJoint::LeftLeg => {
+                    transform.rotation *= Quat::from_rotation_x(-roll_tuck * 0.9);
+                }
+                KnightJoint::RightLeg => {
+                    transform.rotation *= Quat::from_rotation_x(-roll_tuck * 0.9);
+                }
+                KnightJoint::Sword => {}
+            }
+            continue;
+        }
 
         match joint {
             KnightJoint::Hips => {
@@ -616,6 +926,64 @@ fn sword_swing_curve(timer: &Timer) -> f32 {
     } else {
         let recover_t = (t - 0.54) / 0.46;
         1.28 * (1.0 - smoothstep01(recover_t))
+    }
+}
+
+fn animate_death(
+    time: Res<Time>,
+    mut player: Query<(&mut DeathAnim, &HitPoints), With<Player>>,
+    mut joints: Query<(&KnightJoint, &JointRest, &mut Transform)>,
+) {
+    let Ok((mut death_anim, hp)) = player.get_single_mut() else {
+        return;
+    };
+
+    if !hp.is_dead() {
+        return;
+    }
+
+    if !death_anim.active {
+        death_anim.active = true;
+        death_anim.timer.reset();
+    }
+
+    death_anim.timer.tick(time.delta());
+
+    let t = (death_anim.timer.elapsed_secs() / DEATH_ANIM_DURATION).clamp(0.0, 1.0);
+    let fall = smoothstep01(t);
+
+    // Fall sideways to the ground
+    let fall_rotation = fall * (PI / 2.0); // 90 degrees to the side
+    let fall_drop = fall * 0.7; // hips drop toward ground
+
+    for (joint, rest, mut transform) in &mut joints {
+        transform.translation = rest.translation;
+        transform.rotation = rest.rotation;
+
+        match joint {
+            KnightJoint::Hips => {
+                transform.translation.y -= fall_drop;
+                transform.rotation *= Quat::from_rotation_z(fall_rotation);
+            }
+            KnightJoint::Head => {
+                // Head lolls forward
+                transform.rotation *= Quat::from_rotation_x(fall * 0.4);
+            }
+            KnightJoint::LeftArm => {
+                transform.rotation *= Quat::from_rotation_x(-fall * 0.6)
+                    * Quat::from_rotation_z(-fall * 0.3);
+            }
+            KnightJoint::RightArm => {
+                transform.rotation *= Quat::from_rotation_x(-fall * 0.8)
+                    * Quat::from_rotation_z(fall * 0.4);
+            }
+            KnightJoint::Sword => {
+                // Sword drops away
+                transform.rotation *= Quat::from_rotation_x(-fall * 1.2)
+                    * Quat::from_rotation_z(fall * 0.6);
+            }
+            _ => {}
+        }
     }
 }
 

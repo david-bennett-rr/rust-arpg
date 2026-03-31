@@ -10,7 +10,9 @@ mod combat;
 #[cfg(debug_assertions)]
 mod debug;
 mod enemy;
+mod hud;
 mod player;
+mod targeting;
 mod world;
 
 fn main() {
@@ -42,8 +44,10 @@ fn main() {
         camera::CameraPlugin,
         combat::CombatPlugin,
         world::WorldPlugin,
+        targeting::TargetingPlugin,
         player::PlayerPlugin,
         enemy::EnemyPlugin,
+        hud::HudPlugin,
     ));
 
     #[cfg(debug_assertions)]
