@@ -1,0 +1,27 @@
+[package]
+name = "rust-arpg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_asset",
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_sprite",
+    "bevy_color",
+    "multi_threaded",
+    "bevy_text",
+    "bevy_ui",
+    "default_font",
+    "x11",
+    "png",
+] }
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
