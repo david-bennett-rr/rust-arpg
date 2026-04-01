@@ -199,11 +199,7 @@ fn update_debug_overlay(
     text.0 = format!("{fps:.0} fps");
 }
 
-fn log_perf_dips(
-    mut perf_log: ResMut<PerfLog>,
-    time: Res<Time>,
-    file_logger: Res<FileLogger>,
-) {
+fn log_perf_dips(mut perf_log: ResMut<PerfLog>, time: Res<Time>, file_logger: Res<FileLogger>) {
     perf_log.cooldown.tick(time.delta());
 
     let delta_secs = time.delta_secs_f64();

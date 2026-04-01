@@ -6,7 +6,7 @@ use crate::hud::PauseMenuState;
 pub struct GameOver(pub bool);
 
 pub fn game_running(game_over: Res<GameOver>, pause_menu: Option<Res<PauseMenuState>>) -> bool {
-    !game_over.0 && pause_menu.map_or(true, |pause_menu| !pause_menu.open)
+    !game_over.0 && pause_menu.is_none_or(|pause_menu| !pause_menu.open)
 }
 
 pub struct CombatPlugin;

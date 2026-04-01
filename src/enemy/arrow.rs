@@ -60,7 +60,12 @@ pub(super) fn setup_arrow_meshes(
     });
 }
 
-pub(super) fn spawn_arrow(commands: &mut Commands, meshes: &ArrowMeshes, position: Vec3, direction: Vec3) {
+pub(super) fn spawn_arrow(
+    commands: &mut Commands,
+    meshes: &ArrowMeshes,
+    position: Vec3,
+    direction: Vec3,
+) {
     let dir = direction.normalize_or_zero();
     if dir == Vec3::ZERO {
         return;

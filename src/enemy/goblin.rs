@@ -7,11 +7,11 @@ use crate::player::{Player, PlayerCombat};
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::tilemap::{clamp_translation_to_arena, grid_to_world};
 
+use super::arrow::{ArrowMeshes, spawn_arrow};
 use super::{
     Dying, EnemyCollision, SlashTarget, UniqueEnemyMaterials, build_player_slash_state,
     try_player_slash,
 };
-use super::arrow::{spawn_arrow, ArrowMeshes};
 
 #[derive(Component)]
 pub struct GoblinArcher {
@@ -35,7 +35,10 @@ pub(super) struct GoblinRest {
 
 impl GoblinRest {
     fn new(translation: Vec3, rotation: Quat) -> Self {
-        Self { translation, rotation }
+        Self {
+            translation,
+            rotation,
+        }
     }
 }
 
@@ -76,11 +79,7 @@ const GOBLIN_SHOOT_COOLDOWN: f32 = 2.2;
 const GOBLIN_DRAW_TIME: f32 = 0.7;
 const GOBLIN_COLLISION_RADIUS: f32 = 0.75;
 
-pub(super) const GOBLIN_SPAWN_POINTS: [(i32, i32); 3] = [
-    (4, 5),
-    (16, 7),
-    (14, 15),
-];
+pub(super) const GOBLIN_SPAWN_POINTS: [(i32, i32); 3] = [(4, 5), (16, 7), (14, 15)];
 
 pub(super) fn spawn_goblin_archers(
     mut commands: Commands,
@@ -219,24 +218,35 @@ pub(super) fn do_spawn_goblins(
                         Mesh3d(body_mesh.clone()),
                         MeshMaterial3d(cloth.clone()),
                         Transform::IDENTITY,
-                        FlashTint { owner: goblin, base_srgb: cloth_color },
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: cloth_color,
+                        },
                     ));
 
                     // Quiver on back
                     body.spawn((
                         Mesh3d(quiver_body_mesh.clone()),
                         MeshMaterial3d(leather.clone()),
-                        Transform::from_xyz(0.12, 0.20, -0.28)
-                            .with_rotation(Quat::from_rotation_x(-0.15) * Quat::from_rotation_z(-0.10)),
-                        FlashTint { owner: goblin, base_srgb: leather_color },
+                        Transform::from_xyz(0.12, 0.20, -0.28).with_rotation(
+                            Quat::from_rotation_x(-0.15) * Quat::from_rotation_z(-0.10),
+                        ),
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: leather_color,
+                        },
                     ));
                     // Quiver strap
                     body.spawn((
                         Mesh3d(quiver_strap_mesh.clone()),
                         MeshMaterial3d(leather.clone()),
-                        Transform::from_xyz(0.04, 0.28, -0.06)
-                            .with_rotation(Quat::from_rotation_z(0.45) * Quat::from_rotation_x(-0.1)),
-                        FlashTint { owner: goblin, base_srgb: leather_color },
+                        Transform::from_xyz(0.04, 0.28, -0.06).with_rotation(
+                            Quat::from_rotation_z(0.45) * Quat::from_rotation_x(-0.1),
+                        ),
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: leather_color,
+                        },
                     ));
                     // Arrow shafts sticking out
                     for dx in [-0.03_f32, 0.03, 0.0] {
@@ -245,7 +255,10 @@ pub(super) fn do_spawn_goblins(
                             MeshMaterial3d(wood.clone()),
                             Transform::from_xyz(0.12 + dx, 0.48 + dx.abs() * 0.5, -0.28)
                                 .with_rotation(Quat::from_rotation_x(-0.15 + dx * 0.3)),
-                            FlashTint { owner: goblin, base_srgb: wood_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: wood_color,
+                            },
                         ));
                     }
 
@@ -262,20 +275,29 @@ pub(super) fn do_spawn_goblins(
                             Mesh3d(head_mesh.clone()),
                             MeshMaterial3d(skin.clone()),
                             Transform::IDENTITY,
-                            FlashTint { owner: goblin, base_srgb: skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: skin_color,
+                            },
                         ));
                         // Eyes
                         head.spawn((
                             Mesh3d(eye_mesh.clone()),
                             MeshMaterial3d(eye_mat.clone()),
                             Transform::from_xyz(-0.13, 0.05, 0.28),
-                            FlashTint { owner: goblin, base_srgb: eye_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: eye_color,
+                            },
                         ));
                         head.spawn((
                             Mesh3d(eye_mesh.clone()),
                             MeshMaterial3d(eye_mat.clone()),
                             Transform::from_xyz(0.13, 0.05, 0.28),
-                            FlashTint { owner: goblin, base_srgb: eye_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: eye_color,
+                            },
                         ));
                         // Pointy ears
                         head.spawn((
@@ -283,14 +305,20 @@ pub(super) fn do_spawn_goblins(
                             MeshMaterial3d(dark_skin.clone()),
                             Transform::from_xyz(-0.34, 0.06, 0.0)
                                 .with_rotation(Quat::from_rotation_z(PI / 2.5)),
-                            FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: dark_skin_color,
+                            },
                         ));
                         head.spawn((
                             Mesh3d(ear_mesh.clone()),
                             MeshMaterial3d(dark_skin.clone()),
                             Transform::from_xyz(0.34, 0.06, 0.0)
                                 .with_rotation(Quat::from_rotation_z(-PI / 2.5)),
-                            FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: dark_skin_color,
+                            },
                         ));
                         // Nose
                         head.spawn((
@@ -298,7 +326,10 @@ pub(super) fn do_spawn_goblins(
                             MeshMaterial3d(dark_skin.clone()),
                             Transform::from_xyz(0.0, -0.04, 0.30)
                                 .with_rotation(Quat::from_rotation_x(PI / 2.0)),
-                            FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: dark_skin_color,
+                            },
                         ));
                         // Pointy hat
                         head.spawn((
@@ -306,7 +337,10 @@ pub(super) fn do_spawn_goblins(
                             MeshMaterial3d(cloth.clone()),
                             Transform::from_xyz(0.0, 0.40, 0.0)
                                 .with_rotation(Quat::from_rotation_z(0.15)),
-                            FlashTint { owner: goblin, base_srgb: cloth_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: cloth_color,
+                            },
                         ));
                     });
 
@@ -318,8 +352,9 @@ pub(super) fn do_spawn_goblins(
                             Vec3::new(-0.38, 0.15, 0.0),
                             Quat::from_rotation_x(-0.4) * Quat::from_rotation_z(0.2),
                         ),
-                        Transform::from_xyz(-0.38, 0.15, 0.0)
-                            .with_rotation(Quat::from_rotation_x(-0.4) * Quat::from_rotation_z(0.2)),
+                        Transform::from_xyz(-0.38, 0.15, 0.0).with_rotation(
+                            Quat::from_rotation_x(-0.4) * Quat::from_rotation_z(0.2),
+                        ),
                         Visibility::Inherited,
                     ))
                     .with_children(|arm| {
@@ -327,13 +362,19 @@ pub(super) fn do_spawn_goblins(
                             Mesh3d(arm_mesh.clone()),
                             MeshMaterial3d(skin.clone()),
                             Transform::IDENTITY,
-                            FlashTint { owner: goblin, base_srgb: skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: skin_color,
+                            },
                         ));
                         arm.spawn((
                             Mesh3d(hand_mesh.clone()),
                             MeshMaterial3d(dark_skin.clone()),
                             Transform::from_xyz(0.0, -0.34, 0.0),
-                            FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: dark_skin_color,
+                            },
                         ));
 
                         // Bow (child of left arm)
@@ -353,27 +394,39 @@ pub(super) fn do_spawn_goblins(
                                 Mesh3d(bow_grip_mesh.clone()),
                                 MeshMaterial3d(dark_skin.clone()),
                                 Transform::IDENTITY,
-                                FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                                FlashTint {
+                                    owner: goblin,
+                                    base_srgb: dark_skin_color,
+                                },
                             ));
                             bow.spawn((
                                 Mesh3d(bow_limb_mesh.clone()),
                                 MeshMaterial3d(wood.clone()),
                                 Transform::from_xyz(0.0, 0.26, -0.06)
                                     .with_rotation(Quat::from_rotation_x(0.25)),
-                                FlashTint { owner: goblin, base_srgb: wood_color },
+                                FlashTint {
+                                    owner: goblin,
+                                    base_srgb: wood_color,
+                                },
                             ));
                             bow.spawn((
                                 Mesh3d(bow_limb_mesh.clone()),
                                 MeshMaterial3d(wood.clone()),
                                 Transform::from_xyz(0.0, -0.26, -0.06)
                                     .with_rotation(Quat::from_rotation_x(-0.25)),
-                                FlashTint { owner: goblin, base_srgb: wood_color },
+                                FlashTint {
+                                    owner: goblin,
+                                    base_srgb: wood_color,
+                                },
                             ));
                             bow.spawn((
                                 Mesh3d(bow_string_mesh.clone()),
                                 MeshMaterial3d(cloth.clone()),
                                 Transform::from_xyz(0.0, 0.0, 0.05),
-                                FlashTint { owner: goblin, base_srgb: cloth_color },
+                                FlashTint {
+                                    owner: goblin,
+                                    base_srgb: cloth_color,
+                                },
                             ));
                         });
                     });
@@ -382,10 +435,7 @@ pub(super) fn do_spawn_goblins(
                     body.spawn((
                         GoblinOwner(goblin),
                         GoblinJoint::RightArm,
-                        GoblinRest::new(
-                            Vec3::new(0.38, 0.15, 0.0),
-                            Quat::from_rotation_z(-0.15),
-                        ),
+                        GoblinRest::new(Vec3::new(0.38, 0.15, 0.0), Quat::from_rotation_z(-0.15)),
                         Transform::from_xyz(0.38, 0.15, 0.0)
                             .with_rotation(Quat::from_rotation_z(-0.15)),
                         Visibility::Inherited,
@@ -395,13 +445,19 @@ pub(super) fn do_spawn_goblins(
                             Mesh3d(arm_mesh.clone()),
                             MeshMaterial3d(skin.clone()),
                             Transform::IDENTITY,
-                            FlashTint { owner: goblin, base_srgb: skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: skin_color,
+                            },
                         ));
                         arm.spawn((
                             Mesh3d(hand_mesh.clone()),
                             MeshMaterial3d(dark_skin.clone()),
                             Transform::from_xyz(0.0, -0.34, 0.0),
-                            FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                            FlashTint {
+                                owner: goblin,
+                                base_srgb: dark_skin_color,
+                            },
                         ));
                     });
                 });
@@ -420,14 +476,20 @@ pub(super) fn do_spawn_goblins(
                         Mesh3d(leg_mesh.clone()),
                         MeshMaterial3d(dark_skin.clone()),
                         Transform::IDENTITY,
-                        FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: dark_skin_color,
+                        },
                     ));
                     leg.spawn((
                         Mesh3d(foot_mesh.clone()),
                         MeshMaterial3d(cloth.clone()),
                         Transform::from_xyz(0.0, -0.40, 0.04)
                             .with_rotation(Quat::from_rotation_x(-PI / 2.0)),
-                        FlashTint { owner: goblin, base_srgb: cloth_color },
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: cloth_color,
+                        },
                     ));
                 });
 
@@ -445,14 +507,20 @@ pub(super) fn do_spawn_goblins(
                         Mesh3d(leg_mesh.clone()),
                         MeshMaterial3d(dark_skin.clone()),
                         Transform::IDENTITY,
-                        FlashTint { owner: goblin, base_srgb: dark_skin_color },
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: dark_skin_color,
+                        },
                     ));
                     leg.spawn((
                         Mesh3d(foot_mesh.clone()),
                         MeshMaterial3d(cloth.clone()),
                         Transform::from_xyz(0.0, -0.40, 0.04)
                             .with_rotation(Quat::from_rotation_x(-PI / 2.0)),
-                        FlashTint { owner: goblin, base_srgb: cloth_color },
+                        FlashTint {
+                            owner: goblin,
+                            base_srgb: cloth_color,
+                        },
                     ));
                 });
         });
@@ -602,6 +670,15 @@ pub(super) fn animate_goblin_archers(
         } else {
             0.0
         };
+        // Sub-phases for richer draw animation
+        let nock = smoothstep01((draw_progress * 3.0).min(1.0)); // 0-33%: reach and ready
+        let pull = smoothstep01(((draw_progress - 0.25) * 2.0).clamp(0.0, 1.0)); // 25-75%: draw string
+        let hold = smoothstep01(((draw_progress - 0.65) * 3.0).clamp(0.0, 1.0)); // 65-100%: full tension
+        let tremble = if draw_progress > 0.6 {
+            (t * 24.0).sin() * 0.014 * hold
+        } else {
+            0.0
+        };
 
         let idle = !goblin.alerted && goblin.move_blend == 0.0;
         let idle_sway = if idle {
@@ -623,61 +700,67 @@ pub(super) fn animate_goblin_archers(
         match joint {
             GoblinJoint::Body => {
                 transform.translation.y += walk_bob;
-                // Walking torso twist
+                // Settle into shooting stance
+                transform.translation.y -= pull * 0.05;
                 transform.rotation *= Quat::from_rotation_y(walk_swing * 0.08)
-                    // Draw bow lean forward
-                    * Quat::from_rotation_x(draw_progress * 0.12)
-                    // Idle sway
-                    * Quat::from_rotation_z(idle_sway * 0.02)
-                    // Alert heavy breathing
-                    * Quat::from_rotation_x(alert_breath * 0.015);
+                    // Progressive lean into the shot
+                    * Quat::from_rotation_x(
+                        nock * 0.05 + pull * 0.14 + hold * 0.06
+                            + alert_breath * 0.015,
+                    )
+                    // Weight shift toward bow arm
+                    * Quat::from_rotation_z(idle_sway * 0.02 - pull * 0.04);
                 transform.translation.y += idle_sway.abs() * 0.015;
             }
             GoblinJoint::Head => {
-                // Counter-rotate against body during walk for stability
                 transform.rotation *= Quat::from_rotation_y(
-                    -walk_swing * 0.06
-                    + idle_look * 0.10
-                    + draw_progress * 0.04,
-                )
-                // Head bob during walk
-                * Quat::from_rotation_x(
-                    -walk_bob * 0.8
-                    + draw_progress * 0.06
-                    + alert_breath * 0.02,
-                );
+                        -walk_swing * 0.06 + idle_look * 0.10
+                            // Turn to sight along arrow
+                            - nock * 0.06 + tremble,
+                    )
+                        * Quat::from_rotation_x(
+                            -walk_bob * 0.8
+                                // Tilt forward to aim
+                                + pull * 0.12
+                                + hold * 0.05
+                                + alert_breath * 0.02
+                                + tremble,
+                        )
+                        // Aiming head tilt
+                        * Quat::from_rotation_z(-pull * 0.06);
             }
             GoblinJoint::LeftArm => {
-                // Walk counter-swing
                 let arm_swing = walk_swing * 0.25;
-                // Draw: extend bow arm forward
+                // Bow arm extends forward progressively
                 transform.rotation *= Quat::from_rotation_x(
-                    -arm_swing - draw_progress * 0.6
-                )
-                * Quat::from_rotation_z(
-                    -draw_progress * 0.12 + idle_sway * 0.015
-                );
+                    -arm_swing - nock * 0.35 - pull * 0.55 - hold * 0.20 + tremble,
+                ) * Quat::from_rotation_z(
+                    -pull * 0.16 - hold * 0.06 + idle_sway * 0.015,
+                ) * Quat::from_rotation_y(nock * 0.06 + pull * 0.08);
             }
             GoblinJoint::RightArm => {
-                // Walk counter-swing (opposite)
                 let arm_swing = -walk_swing * 0.25;
-                // Draw: pull right arm back to draw string
+                // Draw arm: reach for arrow then pull string back
                 transform.rotation *= Quat::from_rotation_x(
-                    -arm_swing - draw_progress * 1.4
-                )
-                * Quat::from_rotation_z(
-                    draw_progress * 0.20 + idle_sway * 0.015
-                );
+                    -arm_swing - nock * 0.40 - pull * 1.20 - hold * 0.40 + tremble,
+                ) * Quat::from_rotation_z(
+                    pull * 0.24 + hold * 0.10 + idle_sway * 0.015,
+                ) * Quat::from_rotation_y(-pull * 0.10);
             }
             GoblinJoint::LeftLeg => {
-                transform.rotation *= Quat::from_rotation_x(walk_swing * 0.50);
+                // Front leg braces during draw
+                transform.rotation *=
+                    Quat::from_rotation_x(walk_swing * 0.50 + pull * 0.10 + hold * 0.04);
             }
             GoblinJoint::RightLeg => {
-                transform.rotation *= Quat::from_rotation_x(-walk_swing * 0.50);
+                // Weight on back leg
+                transform.rotation *= Quat::from_rotation_x(-walk_swing * 0.50 - pull * 0.06);
             }
             GoblinJoint::Bow => {
-                // Bow tilts during draw
-                transform.rotation *= Quat::from_rotation_x(draw_progress * 0.15);
+                // Bow raises and steadies
+                transform.rotation *=
+                    Quat::from_rotation_x(nock * 0.05 + pull * 0.14 + hold * 0.06)
+                        * Quat::from_rotation_z(-hold * 0.06 + tremble);
             }
         }
     }

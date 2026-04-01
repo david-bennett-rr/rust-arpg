@@ -149,7 +149,7 @@ impl Default for KnightAnimator {
     fn default() -> Self {
         Self {
             walk_phase: 0.0,
-            swing_timer: Timer::from_seconds(0.75, TimerMode::Once),
+            swing_timer: Timer::from_seconds(0.55, TimerMode::Once),
         }
     }
 }
@@ -192,10 +192,10 @@ const MOVE_SPEED: f32 = 8.0;
 const ARRIVE_THRESHOLD: f32 = 0.15;
 pub const PLAYER_MAX_HP: i32 = 20;
 const ATTACK_RANGE: f32 = 2.3;
-const ATTACK_WINDUP: f32 = 0.25;
-const DODGE_DURATION: f32 = 0.25;
+const ATTACK_WINDUP: f32 = 0.14;
+const DODGE_DURATION: f32 = 0.38;
 const DODGE_COOLDOWN: f32 = 0.8;
-const DODGE_SPEED: f32 = 18.0;
+const DODGE_DISTANCE: f32 = 6.4;
 
 const MAX_STAMINA: f32 = 60.0;
 const MAX_MANA: f32 = 40.0;
@@ -206,4 +206,9 @@ const DODGE_STAMINA_COST: f32 = 12.0;
 
 pub fn visual_forward(transform: &Transform) -> Vec3 {
     transform.rotation * Vec3::Z
+}
+
+fn dodge_motion_curve(progress: f32) -> f32 {
+    let clamped = progress.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(3)
 }

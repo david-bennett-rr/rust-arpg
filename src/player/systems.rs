@@ -1,14 +1,15 @@
-use bevy::{input::gamepad::Gamepad, prelude::*};
+use bevy::ecs::system::SystemParam;
 use bevy::window::PrimaryWindow;
+use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::camera::MainCamera;
 use crate::targeting::{TargetState, Targetable};
 use crate::world::tilemap::{clamp_ground_target_to_arena, clamp_translation_to_arena};
 
 use super::{
-    visual_forward, ControllerMove, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat,
-    PlayerStats, ARRIVE_THRESHOLD, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP, DODGE_SPEED,
-    DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
+    ARRIVE_THRESHOLD, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP, ControllerMove,
+    DODGE_DISTANCE, DODGE_STAMINA_COST, Dodge, KnightAnimator, MOVE_SPEED, MoveTarget,
+    PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerStats, dodge_motion_curve, visual_forward,
 };
 
 type DodgePlayer<'w> = Single<
@@ -17,9 +18,22 @@ type DodgePlayer<'w> = Single<
         &'static Transform,
         &'static mut Dodge,
         &'static mut MoveTarget,
+        &'static ControllerMove,
         &'static mut PlayerStats,
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
+    ),
+    With<Player>,
+>;
+
+type AttackPlayer<'w> = Single<
+    'w,
+    (
+        &'static mut Transform,
+        &'static mut MoveTarget,
+        &'static mut KnightAnimator,
+        &'static mut PlayerCombat,
+        &'static mut PlayerStats,
     ),
     With<Player>,
 >;
@@ -43,6 +57,14 @@ impl AttackIntent {
     }
 }
 
+#[derive(SystemParam)]
+pub(super) struct AttackControls<'w, 's> {
+    target_state: Res<'w, TargetState>,
+    mouse_buttons: Res<'w, ButtonInput<MouseButton>>,
+    gamepads: Query<'w, 's, &'static Gamepad>,
+    time: Res<'w, Time>,
+}
+
 pub(super) fn update_controller_move_state(
     gamepads: Query<&Gamepad>,
     camera_query: Option<Single<&Transform, With<MainCamera>>>,
@@ -53,8 +75,12 @@ pub(super) fn update_controller_move_state(
         return;
     };
 
-    player.input =
-        strongest_stick_direction(&gamepads, |gamepad| gamepad.left_stick(), *camera_tf, MOVE_DEADZONE);
+    player.input = strongest_stick_direction(
+        &gamepads,
+        |gamepad| gamepad.left_stick(),
+        *camera_tf,
+        MOVE_DEADZONE,
+    );
 }
 
 pub(super) fn handle_left_click(
@@ -133,17 +159,16 @@ pub(super) fn handle_controller_targeting(
             *camera_tf,
             MOVE_DEADZONE,
         );
-        let right_active = right_input.length_squared() >= TARGET_SWITCH_DEADZONE * TARGET_SWITCH_DEADZONE;
+        let right_active =
+            right_input.length_squared() >= TARGET_SWITCH_DEADZONE * TARGET_SWITCH_DEADZONE;
 
         if right_active && *right_stick_released {
             let excluded = target_state.targeted;
-            if let Some(target) = find_directional_target(
-                player.translation,
-                right_input,
-                excluded,
-                &targetables,
-            )
-            .or_else(|| find_directional_target(player.translation, right_input, None, &targetables))
+            if let Some(target) =
+                find_directional_target(player.translation, right_input, excluded, &targetables)
+                    .or_else(|| {
+                        find_directional_target(player.translation, right_input, None, &targetables)
+                    })
             {
                 target_state.targeted = Some(target);
             }
@@ -172,25 +197,13 @@ pub(super) fn handle_controller_targeting(
 }
 
 pub(super) fn chase_and_attack_target(
-    target_state: Res<TargetState>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
-    gamepads: Query<&Gamepad>,
+    controls: AttackControls<'_, '_>,
     target_transforms: Query<&GlobalTransform, With<Targetable>>,
     controller_move: Single<&ControllerMove, With<Player>>,
-    mut player: Single<
-        (
-            &mut Transform,
-            &mut MoveTarget,
-            &mut KnightAnimator,
-            &mut PlayerCombat,
-            &mut PlayerStats,
-        ),
-        With<Player>,
-    >,
+    mut player: AttackPlayer<'_>,
     mut attack_intent: Local<AttackIntent>,
-    time: Res<Time>,
 ) {
-    let Some(target_entity) = target_state.targeted else {
+    let Some(target_entity) = controls.target_state.targeted else {
         attack_intent.clear();
         return;
     };
@@ -199,10 +212,10 @@ pub(super) fn chase_and_attack_target(
         return;
     };
 
-    let attack_pressed = mouse_buttons.just_pressed(MouseButton::Left)
-        || any_gamepad_just_pressed(&gamepads, GamepadButton::RightTrigger);
-    let attack_held = mouse_buttons.pressed(MouseButton::Left)
-        || any_gamepad_pressed(&gamepads, GamepadButton::RightTrigger);
+    let attack_pressed = controls.mouse_buttons.just_pressed(MouseButton::Left)
+        || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger);
+    let attack_held = controls.mouse_buttons.pressed(MouseButton::Left)
+        || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger);
 
     // Click / bumper sets a pending strike that survives the walk; hold = continuous
     if attack_pressed {
@@ -245,7 +258,7 @@ pub(super) fn chase_and_attack_target(
     }
 
     if can_attack && animator.swing_timer.finished() {
-        attack_intent.windup += time.delta_secs();
+        attack_intent.windup += controls.time.delta_secs();
         if attack_intent.windup >= ATTACK_WINDUP
             && distance <= ATTACK_RANGE
             && stats.spend_stamina(ATTACK_STAMINA_COST)
@@ -271,6 +284,7 @@ pub(super) fn trigger_dodge(
         player_tf,
         ref mut dodge,
         ref mut move_target,
+        controller_move,
         ref mut stats,
         ref mut animator,
         ref mut combat,
@@ -287,12 +301,7 @@ pub(super) fn trigger_dodge(
         return;
     }
 
-    let forward = visual_forward(player_tf).normalize_or_zero();
-    let direction = if forward.length_squared() > 0.001 {
-        Vec3::new(forward.x, 0.0, forward.z).normalize()
-    } else {
-        Vec3::Z
-    };
+    let direction = dodge_direction(player_tf, controller_move, move_target);
 
     dodge.active = true;
     dodge.direction = direction;
@@ -311,21 +320,53 @@ pub(super) fn update_dodge(
 ) {
     let (ref mut player_tf, ref mut dodge) = *player;
 
+    if !dodge.active {
+        dodge.cooldown.tick(time.delta());
+        return;
+    }
+
+    let previous_progress = dodge_progress(dodge);
     dodge.timer.tick(time.delta());
     dodge.cooldown.tick(time.delta());
 
-    if !dodge.active {
-        return;
-    }
-
-    if dodge.timer.finished() {
-        dodge.active = false;
-        return;
-    }
-
-    let step = DODGE_SPEED * time.delta_secs();
+    let progress = dodge_progress(dodge);
+    let step = DODGE_DISTANCE
+        * (dodge_motion_curve(progress) - dodge_motion_curve(previous_progress)).max(0.0);
     player_tf.translation += dodge.direction * step;
     clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+
+    if previous_progress >= 1.0 {
+        dodge.active = false;
+    }
+}
+
+fn dodge_progress(dodge: &Dodge) -> f32 {
+    let duration = dodge.timer.duration().as_secs_f32().max(0.001);
+    (dodge.timer.elapsed_secs() / duration).clamp(0.0, 1.0)
+}
+
+fn dodge_direction(
+    player_tf: &Transform,
+    controller_move: &ControllerMove,
+    move_target: &MoveTarget,
+) -> Vec3 {
+    if controller_move.active() {
+        return Vec3::new(controller_move.input.x, 0.0, controller_move.input.y).normalize();
+    }
+
+    if let Some(target) = move_target.position {
+        let to_target = target - Vec2::new(player_tf.translation.x, player_tf.translation.z);
+        if to_target.length_squared() > 0.0001 {
+            return Vec3::new(to_target.x, 0.0, to_target.y).normalize();
+        }
+    }
+
+    let forward = visual_forward(player_tf).normalize_or_zero();
+    if forward.length_squared() > 0.001 {
+        Vec3::new(forward.x, 0.0, forward.z).normalize()
+    } else {
+        Vec3::Z
+    }
 }
 
 pub(super) fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats, With<Player>>) {
@@ -337,7 +378,10 @@ pub(super) fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats
 }
 
 pub(super) fn move_player_with_controller(
-    mut player_query: Single<(&mut Transform, &mut MoveTarget, &ControllerMove, &Dodge), With<Player>>,
+    mut player_query: Single<
+        (&mut Transform, &mut MoveTarget, &ControllerMove, &Dodge),
+        With<Player>,
+    >,
     time: Res<Time>,
 ) {
     let (ref mut player_tf, ref mut move_target, controller_move, dodge) = *player_query;
@@ -502,7 +546,11 @@ fn find_directional_target(
     best.map(|(entity, _)| entity)
 }
 
-fn target_in_direction(player_translation: Vec3, direction: Vec2, target_translation: Vec3) -> bool {
+fn target_in_direction(
+    player_translation: Vec3,
+    direction: Vec2,
+    target_translation: Vec3,
+) -> bool {
     let direction_len_sq = direction.length_squared();
     if direction_len_sq <= 0.0001 {
         return false;

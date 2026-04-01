@@ -7,7 +7,7 @@ use crate::world::tilemap::{PLAYER_SPAWN_GRID, grid_to_world};
 
 use super::{
     ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget,
-    Player, PlayerCombat, PlayerStats, PLAYER_MAX_HP,
+    PLAYER_MAX_HP, Player, PlayerCombat, PlayerStats,
 };
 
 pub(super) fn spawn_player(
@@ -171,7 +171,10 @@ pub(super) fn spawn_player(
                         Mesh3d(leg_mesh.clone()),
                         MeshMaterial3d(dark_steel.clone()),
                         Transform::from_xyz(0.0, -0.34, 0.0),
-                        FlashTint { owner: player, base_srgb: dark_steel_color },
+                        FlashTint {
+                            owner: player,
+                            base_srgb: dark_steel_color,
+                        },
                     ));
                     leg.spawn((
                         Mesh3d(boot_mesh.clone()),
@@ -179,7 +182,10 @@ pub(super) fn spawn_player(
                         Transform::from_xyz(0.0, -0.74, 0.05)
                             .with_rotation(Quat::from_rotation_x(-PI / 2.0))
                             .with_scale(Vec3::new(1.0, 1.0, 1.25)),
-                        FlashTint { owner: player, base_srgb: trim_color },
+                        FlashTint {
+                            owner: player,
+                            base_srgb: trim_color,
+                        },
                     ));
                 });
 
@@ -194,7 +200,10 @@ pub(super) fn spawn_player(
                         Mesh3d(leg_mesh.clone()),
                         MeshMaterial3d(dark_steel.clone()),
                         Transform::from_xyz(0.0, -0.34, 0.0),
-                        FlashTint { owner: player, base_srgb: dark_steel_color },
+                        FlashTint {
+                            owner: player,
+                            base_srgb: dark_steel_color,
+                        },
                     ));
                     leg.spawn((
                         Mesh3d(boot_mesh.clone()),
@@ -202,7 +211,10 @@ pub(super) fn spawn_player(
                         Transform::from_xyz(0.0, -0.74, 0.05)
                             .with_rotation(Quat::from_rotation_x(-PI / 2.0))
                             .with_scale(Vec3::new(1.0, 1.0, 1.25)),
-                        FlashTint { owner: player, base_srgb: trim_color },
+                        FlashTint {
+                            owner: player,
+                            base_srgb: trim_color,
+                        },
                     ));
                 });
 
@@ -245,13 +257,19 @@ pub(super) fn spawn_player(
                                 Mesh3d(head_mesh.clone()),
                                 MeshMaterial3d(steel.clone()),
                                 Transform::from_xyz(0.0, 0.04, 0.0),
-                                FlashTint { owner: player, base_srgb: steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: steel_color,
+                                },
                             ));
                             head.spawn((
                                 Mesh3d(helmet_mesh.clone()),
                                 MeshMaterial3d(trim.clone()),
                                 Transform::from_xyz(0.0, 0.26, 0.0),
-                                FlashTint { owner: player, base_srgb: trim_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: trim_color,
+                                },
                             ));
                             head.spawn((
                                 Mesh3d(visor_mesh.clone()),
@@ -259,7 +277,10 @@ pub(super) fn spawn_player(
                                 Transform::from_xyz(0.0, 0.07, 0.18)
                                     .with_rotation(Quat::from_rotation_x(PI / 2.0))
                                     .with_scale(Vec3::new(1.0, 0.55, 1.0)),
-                                FlashTint { owner: player, base_srgb: dark_steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: dark_steel_color,
+                                },
                             ));
                             head.spawn((
                                 Mesh3d(plume_mesh.clone()),
@@ -289,19 +310,28 @@ pub(super) fn spawn_player(
                                 Mesh3d(shoulder_mesh.clone()),
                                 MeshMaterial3d(trim.clone()),
                                 Transform::IDENTITY,
-                                FlashTint { owner: player, base_srgb: trim_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: trim_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(arm_mesh.clone()),
                                 MeshMaterial3d(steel.clone()),
                                 Transform::from_xyz(0.0, -0.28, 0.0),
-                                FlashTint { owner: player, base_srgb: steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: steel_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(gauntlet_mesh.clone()),
                                 MeshMaterial3d(dark_steel.clone()),
                                 Transform::from_xyz(0.0, -0.58, 0.0),
-                                FlashTint { owner: player, base_srgb: dark_steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: dark_steel_color,
+                                },
                             ));
                             // Shield
                             arm.spawn((
@@ -310,7 +340,10 @@ pub(super) fn spawn_player(
                                 Transform::from_xyz(-0.06, -0.30, 0.16)
                                     .with_rotation(Quat::from_rotation_x(PI / 2.0))
                                     .with_scale(Vec3::new(1.0, 1.0, 0.85)),
-                                FlashTint { owner: player, base_srgb: dark_steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: dark_steel_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(shield_face_mesh.clone()),
@@ -318,14 +351,20 @@ pub(super) fn spawn_player(
                                 Transform::from_xyz(-0.06, -0.30, 0.16)
                                     .with_rotation(Quat::from_rotation_x(PI / 2.0))
                                     .with_scale(Vec3::new(1.0, 1.0, 0.85)),
-                                FlashTint { owner: player, base_srgb: steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: steel_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(shield_boss_mesh.clone()),
                                 MeshMaterial3d(trim.clone()),
                                 Transform::from_xyz(-0.06, -0.30, 0.20)
                                     .with_scale(Vec3::new(1.0, 0.65, 1.0)),
-                                FlashTint { owner: player, base_srgb: trim_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: trim_color,
+                                },
                             ));
                         });
 
@@ -350,19 +389,28 @@ pub(super) fn spawn_player(
                                 Mesh3d(shoulder_mesh.clone()),
                                 MeshMaterial3d(trim.clone()),
                                 Transform::IDENTITY,
-                                FlashTint { owner: player, base_srgb: trim_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: trim_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(arm_mesh.clone()),
                                 MeshMaterial3d(steel.clone()),
                                 Transform::from_xyz(0.0, -0.28, 0.0),
-                                FlashTint { owner: player, base_srgb: steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: steel_color,
+                                },
                             ));
                             arm.spawn((
                                 Mesh3d(gauntlet_mesh.clone()),
                                 MeshMaterial3d(dark_steel.clone()),
                                 Transform::from_xyz(0.0, -0.58, 0.0),
-                                FlashTint { owner: player, base_srgb: dark_steel_color },
+                                FlashTint {
+                                    owner: player,
+                                    base_srgb: dark_steel_color,
+                                },
                             ));
                             arm.spawn((
                                 KnightJoint::Sword,
@@ -384,20 +432,29 @@ pub(super) fn spawn_player(
                                     Mesh3d(sword_handle_mesh.clone()),
                                     MeshMaterial3d(dark_steel.clone()),
                                     Transform::from_xyz(0.0, -0.10, 0.0),
-                                    FlashTint { owner: player, base_srgb: dark_steel_color },
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: dark_steel_color,
+                                    },
                                 ));
                                 sword.spawn((
                                     Mesh3d(sword_guard_mesh.clone()),
                                     MeshMaterial3d(trim.clone()),
                                     Transform::from_xyz(0.0, -0.22, 0.0)
                                         .with_rotation(Quat::from_rotation_z(PI / 2.0)),
-                                    FlashTint { owner: player, base_srgb: trim_color },
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: trim_color,
+                                    },
                                 ));
                                 sword.spawn((
                                     Mesh3d(sword_blade_mesh.clone()),
                                     MeshMaterial3d(steel.clone()),
                                     Transform::from_xyz(0.0, -0.64, 0.0),
-                                    FlashTint { owner: player, base_srgb: steel_color },
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: steel_color,
+                                    },
                                 ));
                             });
                         });

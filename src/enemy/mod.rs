@@ -11,7 +11,7 @@ use crate::combat::{DamageRng, HitFlash, HitPoints, StunMeter, game_running, smo
 use crate::player::{
     Dodge, PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerSet, visual_forward,
 };
-use crate::targeting::{HighlightGlow, Targetable, TargetState};
+use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::tilemap::clamp_translation_to_arena;
 
 pub use arrow::Arrow;
@@ -29,26 +29,41 @@ impl Plugin for EnemyPlugin {
             .add_systems(PreUpdate, instance_enemy_materials)
             .add_systems(
                 Startup,
-                (rat::spawn_demon_rats, arrow::setup_arrow_meshes, goblin::spawn_goblin_archers).chain(),
+                (
+                    rat::spawn_demon_rats,
+                    arrow::setup_arrow_meshes,
+                    goblin::spawn_goblin_archers,
+                )
+                    .chain(),
             )
             .add_systems(
                 Update,
                 (
-                    rat::update_demon_rats,
-                    goblin::update_goblin_archers,
-                    arrow::update_arrows,
-                    rat::animate_demon_rats,
-                    goblin::animate_goblin_archers,
-                    resolve_actor_collisions,
-                    update_dying,
-                    animate_dying_rats,
-                    animate_dying_goblins,
+                    handle_respawn_enemies,
+                    (
+                        // AI updates are sequential (shared ResMut<DamageRng>, player health)
+                        (
+                            rat::update_demon_rats,
+                            goblin::update_goblin_archers,
+                            arrow::update_arrows,
+                        )
+                            .chain(),
+                        // Animations + collision run in parallel (disjoint entity archetypes)
+                        (
+                            rat::animate_demon_rats,
+                            goblin::animate_goblin_archers,
+                            resolve_actor_collisions,
+                        ),
+                        // Dying tick must precede dying animations (writes Dying progress)
+                        update_dying,
+                        (animate_dying_rats, animate_dying_goblins),
+                    )
+                        .chain()
+                        .run_if(game_running),
                 )
                     .chain()
-                    .run_if(game_running)
                     .after(PlayerSet::Update),
-            )
-            .add_systems(Update, handle_respawn_enemies);
+            );
     }
 }
 
@@ -325,7 +340,12 @@ fn update_dying(
 /// Animate dying rats: body tips over
 fn animate_dying_rats(
     rats: Query<(&DemonRat, &Dying)>,
-    mut joints: Query<(&rat::RatOwner, &rat::RatJoint, &rat::RatRest, &mut Transform)>,
+    mut joints: Query<(
+        &rat::RatOwner,
+        &rat::RatJoint,
+        &rat::RatRest,
+        &mut Transform,
+    )>,
 ) {
     for (owner, joint, rest, mut transform) in &mut joints {
         let Ok((_, dying)) = rats.get(owner.0) else {
@@ -341,8 +361,8 @@ fn animate_dying_rats(
                 transform.translation.y -= t * 0.15;
             }
             rat::RatJoint::Head => {
-                transform.rotation *= Quat::from_rotation_x(t * 0.4)
-                    * Quat::from_rotation_z(t * 0.2);
+                transform.rotation *=
+                    Quat::from_rotation_x(t * 0.4) * Quat::from_rotation_z(t * 0.2);
             }
             rat::RatJoint::Tail => {
                 transform.rotation *= Quat::from_rotation_y(-t * 0.6);
@@ -378,12 +398,12 @@ fn animate_dying_goblins(
                 transform.rotation *= Quat::from_rotation_x(t * 0.5);
             }
             goblin::GoblinJoint::LeftArm => {
-                transform.rotation *= Quat::from_rotation_x(-t * 0.7)
-                    * Quat::from_rotation_z(-t * 0.3);
+                transform.rotation *=
+                    Quat::from_rotation_x(-t * 0.7) * Quat::from_rotation_z(-t * 0.3);
             }
             goblin::GoblinJoint::RightArm => {
-                transform.rotation *= Quat::from_rotation_x(-t * 0.9)
-                    * Quat::from_rotation_z(t * 0.3);
+                transform.rotation *=
+                    Quat::from_rotation_x(-t * 0.9) * Quat::from_rotation_z(t * 0.3);
             }
             goblin::GoblinJoint::LeftLeg => {
                 transform.rotation *= Quat::from_rotation_x(-t * 0.4);

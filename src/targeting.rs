@@ -22,7 +22,8 @@ impl Plugin for TargetingPlugin {
                 )
                     .chain()
                     .before(PlayerSet::Update),
-            );
+            )
+            .add_systems(PostUpdate, clear_removed_highlight_emissive);
     }
 }
 
@@ -154,7 +155,10 @@ fn update_hover(
 
     state.hovered = None;
 
-    if pause_menu.as_ref().is_some_and(|pause_menu| pause_menu.open) {
+    if pause_menu
+        .as_ref()
+        .is_some_and(|pause_menu| pause_menu.open)
+    {
         return;
     }
 
@@ -232,19 +236,50 @@ fn apply_highlight_emissive(
 ) {
     for (entity, glow) in &glows {
         let intensity = glow.amount * 0.8;
-        let emissive = LinearRgba::new(intensity, intensity, intensity, 1.0);
+        set_emissive_recursive(
+            entity,
+            LinearRgba::new(intensity, intensity, intensity, 1.0),
+            &children_query,
+            &material_query,
+            &mut materials,
+        );
+    }
+}
 
-        let mut stack = vec![entity];
-        while let Some(current) = stack.pop() {
-            if let Ok(mat_handle) = material_query.get(current)
-                && let Some(mat) = materials.get_mut(&mat_handle.0)
-            {
-                mat.emissive = emissive;
-            }
-            if let Ok(children) = children_query.get(current) {
-                for &child in children.iter() {
-                    stack.push(child);
-                }
+fn clear_removed_highlight_emissive(
+    mut removed_glows: RemovedComponents<HighlightGlow>,
+    children_query: Query<&Children>,
+    material_query: Query<&MeshMaterial3d<StandardMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for entity in removed_glows.read() {
+        set_emissive_recursive(
+            entity,
+            LinearRgba::new(0.0, 0.0, 0.0, 1.0),
+            &children_query,
+            &material_query,
+            &mut materials,
+        );
+    }
+}
+
+fn set_emissive_recursive(
+    entity: Entity,
+    emissive: LinearRgba,
+    children_query: &Query<&Children>,
+    material_query: &Query<&MeshMaterial3d<StandardMaterial>>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let mut stack = vec![entity];
+    while let Some(current) = stack.pop() {
+        if let Ok(mat_handle) = material_query.get(current)
+            && let Some(mat) = materials.get_mut(&mat_handle.0)
+        {
+            mat.emissive = emissive;
+        }
+        if let Ok(children) = children_query.get(current) {
+            for &child in children.iter() {
+                stack.push(child);
             }
         }
     }

@@ -3,7 +3,7 @@ use bevy::render::{
     RenderPlugin,
     settings::{Backends, InstanceFlags, PowerPreference, WgpuSettings},
 };
-use bevy::window::PresentMode;
+use bevy::window::{PresentMode, WindowMode};
 
 mod camera;
 mod combat;
@@ -15,16 +15,26 @@ mod player;
 mod targeting;
 mod world;
 
+const LOG_FILTER: &str = "wgpu=error,wgpu_hal=error,gilrs=error,naga=warn";
+
 fn main() {
+    normalize_rust_log_env();
+
     let mut app = App::new();
 
     app.add_plugins(
         DefaultPlugins
+            .set(bevy::log::LogPlugin {
+                filter: LOG_FILTER.into(),
+                level: bevy::log::Level::WARN,
+                ..default()
+            })
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Rust ARPG".to_string(),
                     resolution: (1280.0, 720.0).into(),
                     present_mode: default_present_mode(),
+                    mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                     ..default()
                 }),
                 ..default()
@@ -56,18 +66,29 @@ fn main() {
     app.run();
 }
 
+fn normalize_rust_log_env() {
+    let generic_shell_filter = matches!(std::env::var("RUST_LOG").as_deref(), Ok("warn") | Ok(""));
+    if generic_shell_filter || std::env::var_os("RUST_LOG").is_none() {
+        // SAFETY: we set the process env once during single-threaded startup,
+        // before Bevy initializes logging or worker threads.
+        unsafe {
+            std::env::set_var("RUST_LOG", format!("warn,{LOG_FILTER}"));
+        }
+    }
+}
+
 fn default_present_mode() -> PresentMode {
     if cfg!(debug_assertions) {
-        PresentMode::AutoNoVsync
+        PresentMode::Immediate
     } else {
-        PresentMode::AutoVsync
+        PresentMode::Fifo
     }
 }
 
 fn preferred_backends() -> Backends {
     #[cfg(target_os = "windows")]
     {
-        Backends::DX12 | Backends::VULKAN
+        Backends::VULKAN
     }
 
     #[cfg(not(target_os = "windows"))]

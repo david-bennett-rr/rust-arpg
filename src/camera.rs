@@ -5,6 +5,7 @@ use crate::player::Player;
 const CAMERA_OFFSET: Vec3 = Vec3::new(18.0, 20.0, 18.0);
 const CAMERA_LOOK_AT_HEIGHT: f32 = 1.2;
 const CAMERA_VIEWPORT_HEIGHT: f32 = 28.0;
+const CAMERA_DEFAULT_ZOOM: f32 = 0.60;
 const CAMERA_MIN_ZOOM: f32 = 0.45;
 const CAMERA_MAX_ZOOM: f32 = 1.8;
 
@@ -28,6 +29,7 @@ fn spawn_camera(mut commands: Commands) {
             scaling_mode: ScalingMode::FixedVertical {
                 viewport_height: CAMERA_VIEWPORT_HEIGHT,
             },
+            scale: CAMERA_DEFAULT_ZOOM,
             ..OrthographicProjection::default_3d()
         }),
         MainCamera,

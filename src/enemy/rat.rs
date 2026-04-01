@@ -88,14 +88,8 @@ const RAT_BITE_REACH: f32 = 1.48;
 const RAT_HP: i32 = 8;
 const RAT_COLLISION_RADIUS: f32 = 0.58;
 
-pub(super) const RAT_SPAWN_POINTS: [(i32, i32); 6] = [
-    (6, 8),
-    (8, 14),
-    (13, 6),
-    (15, 11),
-    (12, 15),
-    (4, 11),
-];
+pub(super) const RAT_SPAWN_POINTS: [(i32, i32); 6] =
+    [(6, 8), (8, 14), (13, 6), (15, 11), (12, 15), (4, 11)];
 
 pub(super) fn spawn_demon_rats(
     mut commands: Commands,
@@ -232,7 +226,10 @@ pub(super) fn do_spawn_rats(
                         Transform::from_xyz(0.0, 0.28, -0.28)
                             .with_rotation(Quat::from_rotation_x(-0.16))
                             .with_scale(Vec3::new(1.10, 1.45, 1.10)),
-                        FlashTint { owner: rat, base_srgb: bone_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: bone_color,
+                        },
                     ));
                     body.spawn((
                         Mesh3d(spine_mesh.clone()),
@@ -240,7 +237,10 @@ pub(super) fn do_spawn_rats(
                         Transform::from_xyz(0.0, 0.24, 0.18)
                             .with_rotation(Quat::from_rotation_x(-0.28))
                             .with_scale(Vec3::new(0.90, 1.10, 0.90)),
-                        FlashTint { owner: rat, base_srgb: bone_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: bone_color,
+                        },
                     ));
                     body.spawn((
                         Mesh3d(claw_mesh.clone()),
@@ -255,19 +255,28 @@ pub(super) fn do_spawn_rats(
                         Mesh3d(claw_mesh.clone()),
                         MeshMaterial3d(dark_fur.clone()),
                         Transform::from_xyz(0.18, -0.22, 0.30),
-                        FlashTint { owner: rat, base_srgb: dark_fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: dark_fur_color,
+                        },
                     ));
                     body.spawn((
                         Mesh3d(claw_mesh.clone()),
                         MeshMaterial3d(dark_fur.clone()),
                         Transform::from_xyz(-0.20, -0.22, -0.24),
-                        FlashTint { owner: rat, base_srgb: dark_fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: dark_fur_color,
+                        },
                     ));
                     body.spawn((
                         Mesh3d(claw_mesh.clone()),
                         MeshMaterial3d(dark_fur.clone()),
                         Transform::from_xyz(0.20, -0.22, -0.24),
-                        FlashTint { owner: rat, base_srgb: dark_fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: dark_fur_color,
+                        },
                     ));
                 });
 
@@ -284,7 +293,10 @@ pub(super) fn do_spawn_rats(
                         Mesh3d(head_mesh.clone()),
                         MeshMaterial3d(fur.clone()),
                         Transform::from_scale(Vec3::new(1.0, 0.84, 1.10)),
-                        FlashTint { owner: rat, base_srgb: fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: fur_color,
+                        },
                     ));
                     head.spawn((
                         Mesh3d(snout_mesh.clone()),
@@ -301,14 +313,20 @@ pub(super) fn do_spawn_rats(
                         MeshMaterial3d(dark_fur.clone()),
                         Transform::from_xyz(-0.12, 0.15, -0.02)
                             .with_rotation(Quat::from_rotation_x(-0.35)),
-                        FlashTint { owner: rat, base_srgb: dark_fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: dark_fur_color,
+                        },
                     ));
                     head.spawn((
                         Mesh3d(ear_mesh.clone()),
                         MeshMaterial3d(dark_fur.clone()),
                         Transform::from_xyz(0.12, 0.15, -0.02)
                             .with_rotation(Quat::from_rotation_x(-0.35)),
-                        FlashTint { owner: rat, base_srgb: dark_fur_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: dark_fur_color,
+                        },
                     ));
                     head.spawn((
                         Mesh3d(eye_mesh.clone()),
@@ -323,7 +341,10 @@ pub(super) fn do_spawn_rats(
                         Mesh3d(eye_mesh.clone()),
                         MeshMaterial3d(eye.clone()),
                         Transform::from_xyz(0.08, 0.03, 0.15),
-                        FlashTint { owner: rat, base_srgb: eye_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: eye_color,
+                        },
                     ));
                 });
 
@@ -344,7 +365,10 @@ pub(super) fn do_spawn_rats(
                         Mesh3d(tail_mesh.clone()),
                         MeshMaterial3d(flesh.clone()),
                         Transform::IDENTITY,
-                        FlashTint { owner: rat, base_srgb: flesh_color },
+                        FlashTint {
+                            owner: rat,
+                            base_srgb: flesh_color,
+                        },
                     ));
                 });
         });
@@ -501,8 +525,7 @@ pub(super) fn animate_demon_rats(
         let sniff = if idle {
             // Quick periodic sniffing motion
             let sniff_cycle = (t * 3.5 + rat.home.x * 1.7).sin();
-            let sniff_burst = (sniff_cycle * 0.5 + 0.5).powi(4);
-            sniff_burst
+            (sniff_cycle * 0.5 + 0.5).powi(4)
         } else {
             0.0
         };
@@ -521,27 +544,18 @@ pub(super) fn animate_demon_rats(
             RatJoint::Body => {
                 transform.translation.y += move_bob + hop * 0.08 + idle_breath * 0.008;
                 transform.rotation *= Quat::from_rotation_x(
-                    -bite * 0.16 - hop * 0.06
-                    + idle_breath * 0.012
-                    + sniff * 0.03,
-                )
-                    * Quat::from_rotation_z(move_wave * 0.06)
+                    -bite * 0.16 - hop * 0.06 + idle_breath * 0.012 + sniff * 0.03,
+                ) * Quat::from_rotation_z(move_wave * 0.06)
                     * Quat::from_rotation_y(idle_look * 0.04);
             }
             RatJoint::Head => {
                 transform.translation.y += move_bob * 0.6 + hop * 0.05;
-                transform.rotation *= Quat::from_rotation_x(
-                    bite * 0.70 - alert * 0.05
-                    + sniff * 0.14,
-                )
-                    * Quat::from_rotation_y(
-                        move_wave * 0.12
-                        + idle_look * 0.22
-                    );
+                transform.rotation *=
+                    Quat::from_rotation_x(bite * 0.70 - alert * 0.05 + sniff * 0.14)
+                        * Quat::from_rotation_y(move_wave * 0.12 + idle_look * 0.22);
             }
             RatJoint::Tail => {
-                let tail_sway =
-                    (rat.gait_phase * 0.75 + t + rat.home.x * 0.06).sin();
+                let tail_sway = (rat.gait_phase * 0.75 + t + rat.home.x * 0.06).sin();
                 let idle_tail_flick = if idle {
                     let flick = (t * 1.2 + rat.home.z * 2.3).sin();
                     let burst = (flick * 0.5 + 0.5).powi(6);
@@ -549,12 +563,9 @@ pub(super) fn animate_demon_rats(
                 } else {
                     0.0
                 };
-                transform.rotation *=
-                    Quat::from_rotation_y(
-                        tail_sway * (0.24 + rat.move_blend * 0.22)
-                        + idle_tail_flick,
-                    )
-                        * Quat::from_rotation_x(bite * 0.10 - hop * 0.12);
+                transform.rotation *= Quat::from_rotation_y(
+                    tail_sway * (0.24 + rat.move_blend * 0.22) + idle_tail_flick,
+                ) * Quat::from_rotation_x(bite * 0.10 - hop * 0.12);
             }
         }
     }

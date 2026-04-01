@@ -1,9 +1,10 @@
+use bevy::ecs::system::SystemParam;
 use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
 use crate::player::{
-    ControllerMove, DeathAnim, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat,
+    ControllerMove, DeathAnim, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerSet,
     PlayerStats,
 };
 use crate::targeting::TargetState;
@@ -42,10 +43,14 @@ impl Plugin for HudPlugin {
                 (
                     update_hud,
                     sync_pause_menu_visibility,
-                    sync_pause_menu_buttons,
-                    handle_pause_menu_click,
                     check_death,
-                    handle_restart_click,
+                    (
+                        handle_pause_menu_click,
+                        sync_pause_menu_buttons,
+                        handle_restart_click,
+                    )
+                        .chain()
+                        .before(PlayerSet::Update),
                 ),
             );
     }
@@ -99,7 +104,10 @@ impl PauseMenuState {
     }
 
     fn select_next(&mut self) {
-        self.select_previous();
+        self.selected = match self.selected {
+            PauseMenuAction::Resume => PauseMenuAction::RestartLevel,
+            PauseMenuAction::RestartLevel => PauseMenuAction::Resume,
+        };
     }
 }
 
@@ -197,6 +205,18 @@ type RestartButtonInteractions<'w, 's> = Query<
     (Changed<Interaction>, With<RestartButton>),
 >;
 
+type PauseMenuButtonInteractions<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Interaction, &'static PauseMenuButton),
+    (Changed<Interaction>, With<Button>),
+>;
+
+type DeathScreenVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility, With<DeathScreen>>;
+
+type PauseMenuVisibilityQuery<'w, 's> =
+    Query<'w, 's, &'static mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>;
+
 type RestartPlayer<'w> = Option<
     Single<
         'w,
@@ -215,6 +235,75 @@ type RestartPlayer<'w> = Option<
         With<Player>,
     >,
 >;
+
+#[derive(SystemParam)]
+struct RestartContext<'w, 's> {
+    game_over: ResMut<'w, GameOver>,
+    pause_menu: ResMut<'w, PauseMenuState>,
+    death_screen: DeathScreenVisibilityQuery<'w, 's>,
+    pause_menu_visibility: PauseMenuVisibilityQuery<'w, 's>,
+    player: RestartPlayer<'w>,
+    target_state: ResMut<'w, TargetState>,
+    respawn_event: EventWriter<'w, RespawnEnemies>,
+}
+
+impl RestartContext<'_, '_> {
+    fn execute_pause_menu_action(&mut self, action: PauseMenuAction) {
+        match action {
+            PauseMenuAction::Resume => self.resume(),
+            PauseMenuAction::RestartLevel => self.restart_level(),
+        }
+    }
+
+    fn resume(&mut self) {
+        self.pause_menu.close();
+        for mut visibility in &mut self.pause_menu_visibility {
+            *visibility = Visibility::Hidden;
+        }
+    }
+
+    fn restart_level(&mut self) {
+        self.game_over.0 = false;
+        self.pause_menu.close();
+
+        for mut visibility in &mut self.death_screen {
+            *visibility = Visibility::Hidden;
+        }
+        for mut visibility in &mut self.pause_menu_visibility {
+            *visibility = Visibility::Hidden;
+        }
+
+        if let Some(player) = self.player.as_mut() {
+            let (
+                ref mut transform,
+                ref mut hit_points,
+                ref mut stats,
+                ref mut combat,
+                ref mut dodge,
+                ref mut move_target,
+                ref mut controller_move,
+                ref mut death_anim,
+                ref mut animator,
+                ref mut flash,
+            ) = **player;
+            transform.translation = grid_to_world(PLAYER_SPAWN_GRID.0, PLAYER_SPAWN_GRID.1);
+            transform.rotation = Quat::IDENTITY;
+            hit_points.current = hit_points.max;
+            **stats = PlayerStats::default();
+            **combat = PlayerCombat::default();
+            **dodge = Dodge::default();
+            **controller_move = ControllerMove::default();
+            **death_anim = DeathAnim::default();
+            **animator = KnightAnimator::default();
+            **flash = HitFlash::default();
+            move_target.position = None;
+        }
+
+        self.target_state.hovered = None;
+        self.target_state.targeted = None;
+        self.respawn_event.send(RespawnEnemies);
+    }
+}
 
 fn spawn_pause_menu(mut commands: Commands) {
     commands
@@ -403,7 +492,8 @@ fn navigate_pause_menu(
         return;
     }
 
-    let navigate_up = keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::KeyW);
+    let navigate_up =
+        keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::KeyW);
     let navigate_down =
         keyboard.just_pressed(KeyCode::ArrowDown) || keyboard.just_pressed(KeyCode::KeyS);
 
@@ -436,15 +526,9 @@ fn navigate_pause_menu(
 fn activate_pause_menu_selection(
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
-    mut game_over: ResMut<GameOver>,
-    mut pause_menu: ResMut<PauseMenuState>,
-    mut death_screen: Query<&mut Visibility, With<DeathScreen>>,
-    mut pause_menu_visibility: Query<&mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>,
-    mut player: RestartPlayer<'_>,
-    mut target_state: ResMut<TargetState>,
-    mut respawn_event: EventWriter<RespawnEnemies>,
+    mut restart: RestartContext<'_, '_>,
 ) {
-    if !pause_menu.open {
+    if !restart.pause_menu.open {
         return;
     }
 
@@ -457,16 +541,8 @@ fn activate_pause_menu_selection(
         return;
     }
 
-    execute_pause_menu_action(
-        pause_menu.selected,
-        &mut game_over,
-        &mut pause_menu,
-        &mut death_screen,
-        &mut pause_menu_visibility,
-        &mut player,
-        &mut target_state,
-        &mut respawn_event,
-    );
+    let action = restart.pause_menu.selected;
+    restart.execute_pause_menu_action(action);
 }
 
 fn sync_pause_menu_visibility(
@@ -501,51 +577,35 @@ fn sync_pause_menu_buttons(
 }
 
 fn handle_pause_menu_click(
-    mut game_over: ResMut<GameOver>,
-    mut pause_menu: ResMut<PauseMenuState>,
-    mut buttons: Query<(&Interaction, &PauseMenuButton), (Changed<Interaction>, With<Button>)>,
-    mut death_screen: Query<&mut Visibility, With<DeathScreen>>,
-    mut pause_menu_visibility: Query<&mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>,
-    mut player: RestartPlayer<'_>,
-    mut target_state: ResMut<TargetState>,
-    mut respawn_event: EventWriter<RespawnEnemies>,
+    mut buttons: PauseMenuButtonInteractions<'_, '_>,
+    mut restart: RestartContext<'_, '_>,
 ) {
-    if !pause_menu.open {
+    if !restart.pause_menu.open {
         return;
     }
 
+    let mut action_to_execute = None;
     for (interaction, button) in &mut buttons {
         match interaction {
             Interaction::Hovered => {
-                pause_menu.selected = button.0;
+                restart.pause_menu.selected = button.0;
             }
             Interaction::Pressed => {
-                pause_menu.selected = button.0;
-                execute_pause_menu_action(
-                    button.0,
-                    &mut game_over,
-                    &mut pause_menu,
-                    &mut death_screen,
-                    &mut pause_menu_visibility,
-                    &mut player,
-                    &mut target_state,
-                    &mut respawn_event,
-                );
+                restart.pause_menu.selected = button.0;
+                action_to_execute = Some(button.0);
             }
             Interaction::None => {}
         }
     }
+
+    if let Some(action) = action_to_execute {
+        restart.execute_pause_menu_action(action);
+    }
 }
 
 fn handle_restart_click(
-    mut game_over: ResMut<GameOver>,
-    mut pause_menu: ResMut<PauseMenuState>,
     mut interaction_query: RestartButtonInteractions<'_, '_>,
-    mut death_screen: Query<&mut Visibility, With<DeathScreen>>,
-    mut pause_menu_visibility: Query<&mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>,
-    mut player: RestartPlayer<'_>,
-    mut target_state: ResMut<TargetState>,
-    mut respawn_event: EventWriter<RespawnEnemies>,
+    mut restart: RestartContext<'_, '_>,
 ) {
     for (interaction, mut bg) in &mut interaction_query {
         match interaction {
@@ -554,100 +614,11 @@ fn handle_restart_click(
             }
             Interaction::Pressed => {
                 *bg = BackgroundColor(Color::srgb(0.45, 0.45, 0.45));
-                restart_level(
-                    &mut game_over,
-                    &mut pause_menu,
-                    &mut death_screen,
-                    &mut pause_menu_visibility,
-                    &mut player,
-                    &mut target_state,
-                    &mut respawn_event,
-                );
+                restart.restart_level();
             }
             Interaction::None => {
                 *bg = BackgroundColor(Color::srgb(0.25, 0.25, 0.25));
             }
         }
     }
-}
-
-fn execute_pause_menu_action(
-    action: PauseMenuAction,
-    game_over: &mut GameOver,
-    pause_menu: &mut PauseMenuState,
-    death_screen: &mut Query<&mut Visibility, With<DeathScreen>>,
-    pause_menu_visibility: &mut Query<&mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>,
-    player: &mut RestartPlayer<'_>,
-    target_state: &mut ResMut<TargetState>,
-    respawn_event: &mut EventWriter<RespawnEnemies>,
-) {
-    match action {
-        PauseMenuAction::Resume => {
-            pause_menu.close();
-            for mut vis in pause_menu_visibility.iter_mut() {
-                *vis = Visibility::Hidden;
-            }
-        }
-        PauseMenuAction::RestartLevel => {
-            restart_level(
-                game_over,
-                pause_menu,
-                death_screen,
-                pause_menu_visibility,
-                player,
-                target_state,
-                respawn_event,
-            );
-        }
-    }
-}
-
-fn restart_level(
-    game_over: &mut GameOver,
-    pause_menu: &mut PauseMenuState,
-    death_screen: &mut Query<&mut Visibility, With<DeathScreen>>,
-    pause_menu_visibility: &mut Query<&mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>,
-    player: &mut RestartPlayer<'_>,
-    target_state: &mut ResMut<TargetState>,
-    respawn_event: &mut EventWriter<RespawnEnemies>,
-) {
-    game_over.0 = false;
-    pause_menu.close();
-
-    for mut vis in death_screen.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-    for mut vis in pause_menu_visibility.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-
-    if let Some(p) = player {
-        let (
-            ref mut tf,
-            ref mut hp,
-            ref mut stats,
-            ref mut combat,
-            ref mut dodge,
-            ref mut move_target,
-            ref mut controller_move,
-            ref mut death_anim,
-            ref mut animator,
-            ref mut flash,
-        ) = **p;
-        tf.translation = grid_to_world(PLAYER_SPAWN_GRID.0, PLAYER_SPAWN_GRID.1);
-        tf.rotation = Quat::IDENTITY;
-        hp.current = hp.max;
-        **stats = PlayerStats::default();
-        **combat = PlayerCombat::default();
-        **dodge = Dodge::default();
-        **controller_move = ControllerMove::default();
-        **death_anim = DeathAnim::default();
-        **animator = KnightAnimator::default();
-        **flash = HitFlash::default();
-        move_target.position = None;
-    }
-
-    target_state.hovered = None;
-    target_state.targeted = None;
-    respawn_event.send(RespawnEnemies);
 }

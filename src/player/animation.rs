@@ -5,23 +5,26 @@ use bevy::prelude::*;
 use crate::combat::{HitPoints, smoothstep01};
 
 use super::{
-    ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget, Player,
-    PlayerCombat, DEATH_ANIM_DURATION,
+    ControllerMove, DEATH_ANIM_DURATION, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint,
+    MoveTarget, Player, PlayerCombat, dodge_motion_curve,
 };
+
+type AnimatedPlayer<'w> = Single<
+    'w,
+    (
+        &'static MoveTarget,
+        &'static ControllerMove,
+        &'static Dodge,
+        &'static HitPoints,
+        &'static mut KnightAnimator,
+        &'static mut PlayerCombat,
+    ),
+    With<Player>,
+>;
 
 pub(super) fn animate_knight(
     time: Res<Time>,
-    mut player: Single<
-        (
-            &MoveTarget,
-            &ControllerMove,
-            &Dodge,
-            &HitPoints,
-            &mut KnightAnimator,
-            &mut PlayerCombat,
-        ),
-        With<Player>,
-    >,
+    mut player: AnimatedPlayer<'_>,
     mut joints: Query<(&KnightJoint, &JointRest, &mut Transform)>,
 ) {
     let (move_target, controller_move, dodge, hp, ref mut animator, ref mut combat) = *player;
@@ -59,16 +62,8 @@ pub(super) fn animate_knight(
 
     // Idle breathing / weight-shift (only when standing still and not swinging)
     let idle = !moving && !dodge.active && animator.swing_timer.finished();
-    let breath = if idle {
-        (elapsed * 1.4).sin()
-    } else {
-        0.0
-    };
-    let idle_shift = if idle {
-        (elapsed * 0.6).sin()
-    } else {
-        0.0
-    };
+    let breath = if idle { (elapsed * 1.4).sin() } else { 0.0 };
+    let idle_shift = if idle { (elapsed * 0.6).sin() } else { 0.0 };
     let sword_swing = if dodge.active {
         0.0
     } else {
@@ -88,7 +83,7 @@ pub(super) fn animate_knight(
     };
     // Full forward tumble: smoothstep for natural acceleration/deceleration
     let roll_angle = if dodge.active {
-        smoothstep01(dodge_t) * PI * 2.0
+        dodge_motion_curve(dodge_t) * PI * 2.0
     } else {
         0.0
     };
@@ -138,13 +133,21 @@ pub(super) fn animate_knight(
             continue;
         }
 
+        // Rotation budget (peak windup=0.50, peak strike=1.60):
+        //   Arm X:   40° back  + 50° forward  = 90° arm arc
+        //   Sword X: 17° back  + 29° forward  = 46° blade arc
+        //   Sword Z:             37° cross-body sweep
+        //   Body Y:   8° right + 31° left      = 39° torso twist
+        //   Total visible blade sweep ≈ 130°
         match joint {
             KnightJoint::Hips => {
                 transform.translation.y += walk_bob + breath * 0.008;
-                transform.rotation *= Quat::from_rotation_x(-sword_strike * 0.04)
+                transform.translation.z += sword_strike * 0.06;
+                transform.rotation *= Quat::from_rotation_x(-sword_strike * 0.08)
                     * Quat::from_rotation_y(
-                        walk_swing * 0.05 - sword_windup * 0.06 + sword_strike * 0.10
-                        + idle_shift * 0.018,
+                        walk_swing * 0.05 - sword_windup * 0.10
+                            + sword_strike * 0.14
+                            + idle_shift * 0.018,
                     )
                     * Quat::from_rotation_z(idle_shift * 0.012);
             }
@@ -152,64 +155,62 @@ pub(super) fn animate_knight(
                 transform.translation.y += walk_bob * 0.4 + breath * 0.014;
                 transform.rotation *=
                     Quat::from_rotation_x(
-                        sword_windup * 0.16 - sword_strike * 0.28
-                        + breath * 0.018,
-                    )
-                        * Quat::from_rotation_y(
-                            -walk_swing * 0.12 - sword_windup * 0.10 + sword_strike * 0.12
+                        sword_windup * 0.08 - sword_strike * 0.14 + breath * 0.018,
+                    ) * Quat::from_rotation_y(
+                        -walk_swing * 0.12 - sword_windup * 0.18 + sword_strike * 0.20
                             - idle_shift * 0.012,
-                        )
-                        * Quat::from_rotation_z(-sword_windup * 0.04 + sword_strike * 0.06);
+                    ) * Quat::from_rotation_z(-sword_windup * 0.03 + sword_strike * 0.05);
             }
             KnightJoint::Head => {
-                transform.rotation *=
-                    Quat::from_rotation_x(
-                        sword_windup * 0.04 - sword_strike * 0.05
-                        - breath * 0.010
-                        - walk_bob * 0.15,
-                    )
-                        * Quat::from_rotation_y(
-                            sword_windup * 0.03 - sword_strike * 0.05
-                            + idle_shift * 0.035
-                            + walk_swing * 0.04,
-                        );
+                transform.rotation *= Quat::from_rotation_x(
+                    sword_windup * 0.03 - sword_strike * 0.05 - breath * 0.010 - walk_bob * 0.15,
+                ) * Quat::from_rotation_y(
+                    sword_windup * 0.04 - sword_strike * 0.06
+                        + idle_shift * 0.035
+                        + walk_swing * 0.04,
+                );
             }
             KnightJoint::LeftArm => {
-                transform.rotation *=
-                    Quat::from_rotation_x(
-                        -walk_swing * 0.50 + sword_windup * 0.08 - sword_strike * 0.04
-                        + breath * 0.02,
-                    ) * Quat::from_rotation_z(
-                        sword_windup * 0.04 + sword_strike * 0.06
-                        - idle_shift * 0.015,
-                    );
+                // Shield arm: small sympathetic brace, mostly stays put
+                transform.rotation *= Quat::from_rotation_x(
+                    -walk_swing * 0.50 + sword_windup * 0.06 - sword_strike * 0.08 + breath * 0.02,
+                ) * Quat::from_rotation_z(-idle_shift * 0.015);
             }
             KnightJoint::RightArm => {
-                transform.rotation *=
-                    Quat::from_rotation_x(
-                        walk_swing * 0.18 + sword_windup * 1.86 - sword_strike * 2.48
-                        - breath * 0.015,
-                    ) * Quat::from_rotation_y(sword_windup * 0.22 - sword_strike * 0.16)
-                        * Quat::from_rotation_z(
-                            sword_windup * 0.10 - sword_strike * 0.18
-                            + idle_shift * 0.012,
-                        );
+                // Sword arm: ~40° pullback, ~50° forward sweep
+                transform.rotation *= Quat::from_rotation_x(
+                    walk_swing * 0.18 + sword_windup * 1.40 - sword_strike * 0.90 - breath * 0.015,
+                ) * Quat::from_rotation_y(
+                    sword_windup * 0.15 - sword_strike * 0.10,
+                ) * Quat::from_rotation_z(
+                    sword_windup * 0.06 - sword_strike * 0.10 + idle_shift * 0.012,
+                );
             }
             KnightJoint::LeftLeg => {
-                transform.rotation *= Quat::from_rotation_x(walk_swing * 0.60);
+                transform.rotation *=
+                    Quat::from_rotation_x(walk_swing * 0.60 + sword_strike * 0.08);
             }
             KnightJoint::RightLeg => {
-                transform.rotation *= Quat::from_rotation_x(-walk_swing * 0.60);
+                transform.rotation *=
+                    Quat::from_rotation_x(-walk_swing * 0.60 - sword_strike * 0.06);
             }
             KnightJoint::Sword => {
+                // Blade raises on windup, sweeps down and across on strike
                 transform.rotation *=
-                    Quat::from_rotation_x(sword_windup * 1.22 - sword_strike * 1.72)
-                        * Quat::from_rotation_y(-sword_windup * 0.06 + sword_strike * 0.08)
-                        * Quat::from_rotation_z(-sword_windup * 0.04 - sword_strike * 0.72);
+                    Quat::from_rotation_x(sword_windup * 0.60 - sword_strike * 0.50)
+                        * Quat::from_rotation_z(-sword_strike * 0.40);
             }
         }
     }
 }
+
+// Sword swing phase boundaries (fraction of total swing duration)
+const SWING_WINDUP_END: f32 = 0.16;
+const SWING_STRIKE_END: f32 = 0.42;
+// Amplitude at each phase transition
+const SWING_WINDUP_PEAK: f32 = -0.50;
+const SWING_STRIKE_TRAVEL: f32 = 2.10;
+const SWING_STRIKE_PEAK: f32 = SWING_WINDUP_PEAK + SWING_STRIKE_TRAVEL;
 
 fn sword_swing_curve(timer: &Timer) -> f32 {
     if timer.finished() {
@@ -222,14 +223,17 @@ fn sword_swing_curve(timer: &Timer) -> f32 {
     }
 
     let t = timer.elapsed_secs() / duration;
-    if t < 0.24 {
-        -0.68 * smoothstep01(t / 0.24)
-    } else if t < 0.54 {
-        let strike_t = (t - 0.24) / 0.30;
-        -0.68 + 1.96 * smoothstep01(strike_t)
+    if t < SWING_WINDUP_END {
+        // Smooth anticipation pullback
+        SWING_WINDUP_PEAK * smoothstep01(t / SWING_WINDUP_END)
+    } else if t < SWING_STRIKE_END {
+        let strike_t = (t - SWING_WINDUP_END) / (SWING_STRIKE_END - SWING_WINDUP_END);
+        // Cubic ease-out: explosive start, gradual deceleration
+        let ease = 1.0 - (1.0 - strike_t).powi(3);
+        SWING_WINDUP_PEAK + SWING_STRIKE_TRAVEL * ease
     } else {
-        let recover_t = (t - 0.54) / 0.46;
-        1.28 * (1.0 - smoothstep01(recover_t))
+        let recover_t = (t - SWING_STRIKE_END) / (1.0 - SWING_STRIKE_END);
+        SWING_STRIKE_PEAK * (1.0 - smoothstep01(recover_t))
     }
 }
 
