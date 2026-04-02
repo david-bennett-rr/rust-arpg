@@ -17,7 +17,7 @@ pub(super) fn spawn_player(
     floor_map: Option<Res<FloorMap>>,
 ) {
     let start = floor_map
-        .map(|fm| fm.rooms[fm.start_room].world_center)
+        .map(|fm| fm.rooms[fm.start_room].world_center + Vec3::new(0.0, 0.0, -2.5))
         .unwrap_or(Vec3::ZERO);
 
     let steel_color = Vec3::new(0.70, 0.74, 0.80);

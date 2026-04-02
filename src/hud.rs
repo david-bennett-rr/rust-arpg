@@ -441,7 +441,7 @@ impl RestartContext<'_, '_> {
                 ref mut animator,
                 ref mut flash,
             ) = **player;
-            transform.translation = bonfire_pos;
+            transform.translation = bonfire_pos + Vec3::new(0.0, 0.0, -2.5);
             transform.rotation = Quat::IDENTITY;
             hit_points.heal_to_full();
             **stats = PlayerStats::default();
@@ -584,12 +584,7 @@ fn init_bonfire_position(
 #[derive(SystemParam)]
 struct DeathSequenceContext<'w, 's> {
     time: Res<'w, Time>,
-    game_over: ResMut<'w, GameOver>,
-    pause_menu: ResMut<'w, PauseMenuState>,
     respawn_state: ResMut<'w, DeathRespawnState>,
-    last_bonfire: Res<'w, LastBonfirePosition>,
-    player_query: Option<Single<'w, (&'static HitPoints, &'static DeathAnim), With<Player>>>,
-    death_screen_vis: Query<'w, 's, &'static mut Visibility, With<DeathScreen>>,
     death_screen_bg: Query<'w, 's, &'static mut BackgroundColor, With<DeathScreen>>,
     death_text: Query<'w, 's, &'static mut TextColor, With<DeathText>>,
     restart: RestartContext<'w, 's>,
@@ -600,23 +595,24 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
 
     match ctx.respawn_state.phase {
         DeathPhase::Alive => {
-            let Some(player) = ctx.player_query else {
+            let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (hp, _) = *player;
-            if hp.is_dead() && !ctx.game_over.0 {
-                ctx.game_over.0 = true;
-                ctx.pause_menu.close();
+            let (_, ref hp, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
+            let _ = death_anim;
+            if hp.is_dead() && !ctx.restart.game_over.0 {
+                ctx.restart.game_over.0 = true;
+                ctx.restart.pause_menu.close();
                 ctx.respawn_state.phase = DeathPhase::Dying;
             }
         }
         DeathPhase::Dying => {
-            let Some(player) = ctx.player_query else {
+            let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (_, death_anim) = *player;
+            let (_, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
             if death_anim.active && death_anim.timer.finished() {
-                for mut vis in &mut ctx.death_screen_vis {
+                for mut vis in &mut ctx.restart.death_screen {
                     *vis = Visibility::Visible;
                 }
                 ctx.respawn_state.phase = DeathPhase::FadeOut(0.0);
@@ -644,7 +640,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
             for mut color in &mut ctx.death_text {
                 *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
             }
-            let bonfire_pos = ctx.last_bonfire.0;
+            let bonfire_pos = ctx.restart.last_bonfire.0;
             ctx.restart.respawn_at_bonfire(bonfire_pos);
             ctx.respawn_state.phase = DeathPhase::FadeIn(0.0);
         }
@@ -655,7 +651,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
                 *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, alpha));
             }
             if *elapsed >= DEATH_FADE_IN_DURATION {
-                for mut vis in &mut ctx.death_screen_vis {
+                for mut vis in &mut ctx.restart.death_screen {
                     *vis = Visibility::Hidden;
                 }
                 ctx.respawn_state.phase = DeathPhase::Alive;

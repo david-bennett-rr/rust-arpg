@@ -710,7 +710,7 @@ fn sample_visibility_strength(
         return 0.0;
     }
 
-    if distance_sq > 0.0001 && !wall_index.segment_clear(player_ground, sample, 0.0) {
+    if distance_sq > 0.0001 && !wall_index.segment_clear_los(player_ground, sample, 0.0) {
         return 0.0;
     }
 
@@ -749,6 +749,7 @@ mod tests {
         wall_index.rebuild(vec![WallSegment {
             center: Vec2::new(5.0, 0.0),
             half_extents: Vec2::new(1.0, 1.0),
+            blocks_los: true,
         }]);
 
         assert!(!sample_visible(

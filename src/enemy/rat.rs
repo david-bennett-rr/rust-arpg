@@ -410,7 +410,7 @@ pub(super) fn update_demon_rats(
         transform.translation.y = 0.0;
 
         let rat_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
-        let player_clear_path = ctx.wall_index.segment_clear(
+        let player_clear_path = ctx.wall_index.segment_clear_los(
             Vec2::new(player_ground.x, player_ground.z),
             Vec2::new(rat_ground.x, rat_ground.z),
             0.0,
@@ -451,7 +451,7 @@ pub(super) fn update_demon_rats(
         let player_distance = to_player.length();
         let to_home = rat.home - rat_ground;
         let home_distance = to_home.length();
-        let clear_path_to_player = ctx.wall_index.segment_clear(
+        let clear_path_to_player = ctx.wall_index.segment_clear_los(
             Vec2::new(rat_ground.x, rat_ground.z),
             Vec2::new(player_ground.x, player_ground.z),
             RAT_COLLISION_RADIUS,

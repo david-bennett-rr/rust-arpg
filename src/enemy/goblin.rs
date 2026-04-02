@@ -607,7 +607,7 @@ pub(super) fn update_goblin_archers(
         transform.translation.y = 0.0;
 
         let goblin_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
-        let player_clear_path = ctx.wall_index.segment_clear(
+        let player_clear_path = ctx.wall_index.segment_clear_los(
             Vec2::new(player_ground.x, player_ground.z),
             Vec2::new(goblin_ground.x, goblin_ground.z),
             0.0,
@@ -642,7 +642,7 @@ pub(super) fn update_goblin_archers(
         let player_distance = to_player.length();
         let to_home = goblin.home - goblin_ground;
         let home_distance = to_home.length();
-        let clear_path_to_player = ctx.wall_index.segment_clear(
+        let clear_path_to_player = ctx.wall_index.segment_clear_los(
             Vec2::new(goblin_ground.x, goblin_ground.z),
             Vec2::new(player_ground.x, player_ground.z),
             GOBLIN_COLLISION_RADIUS,
@@ -890,6 +890,7 @@ mod tests {
         wall_index.rebuild(vec![WallSegment {
             center: Vec2::new(-1.8, 0.0),
             half_extents: Vec2::new(0.15, 0.05),
+            blocks_los: true,
         }]);
         let direction =
             choose_flee_direction(Vec2::ZERO, Vec2::new(2.0, 0.0), 1.0, &bounds, &wall_index);

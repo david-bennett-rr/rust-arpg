@@ -77,6 +77,20 @@ fn spawn_floor(
             &mut wall_segments,
         );
     }
+    // Spawn bonfires in start rooms (before wall index rebuild so they block movement)
+    for placed in &floor_map.rooms {
+        let template = &floor_map.templates[placed.template_index];
+        if template.tag == RoomTag::Start {
+            spawn_bonfire(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                placed.world_center,
+                &mut wall_segments,
+            );
+        }
+    }
+
     wall_index.rebuild(wall_segments);
 
     // Bounds = AABB of the entire floor (rooms + corridors)
@@ -120,14 +134,6 @@ fn spawn_floor(
     // Spawn enemies directly (FloorMap isn't available as Res yet during Startup)
     enemy::spawn_enemies_from_floor(&mut commands, &mut meshes, &mut materials, &floor_map);
 
-    // Spawn bonfires in start rooms
-    for placed in &floor_map.rooms {
-        let template = &floor_map.templates[placed.template_index];
-        if template.tag == RoomTag::Start {
-            spawn_bonfire(&mut commands, &mut meshes, &mut materials, placed.world_center);
-        }
-    }
-
     // Lighting
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.72, 0.75, 0.84),
@@ -152,15 +158,20 @@ pub struct Bonfire {
     pub lit: bool,
 }
 
+const BONFIRE_COLLISION_RADIUS: f32 = 0.85;
+
 fn spawn_bonfire(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     center: Vec3,
+    wall_segments: &mut Vec<WallSegment>,
 ) {
     let stone_color = Vec3::new(0.25, 0.24, 0.22);
     let ember_color = Vec3::new(0.90, 0.35, 0.08);
+    let flame_color = Vec3::new(1.0, 0.55, 0.08);
     let ash_color = Vec3::new(0.15, 0.13, 0.12);
+    let wood_color = Vec3::new(0.35, 0.22, 0.10);
 
     let stone = materials.add(StandardMaterial {
         base_color: Color::srgb(stone_color.x, stone_color.y, stone_color.z),
@@ -169,8 +180,14 @@ fn spawn_bonfire(
     });
     let ember = materials.add(StandardMaterial {
         base_color: Color::srgb(ember_color.x, ember_color.y, ember_color.z),
-        emissive: LinearRgba::new(2.5, 0.8, 0.15, 1.0),
+        emissive: LinearRgba::new(3.0, 1.0, 0.2, 1.0),
         perceptual_roughness: 0.7,
+        ..default()
+    });
+    let flame = materials.add(StandardMaterial {
+        base_color: Color::srgb(flame_color.x, flame_color.y, flame_color.z),
+        emissive: LinearRgba::new(6.0, 2.5, 0.4, 1.0),
+        perceptual_roughness: 0.5,
         ..default()
     });
     let ash = materials.add(StandardMaterial {
@@ -178,15 +195,50 @@ fn spawn_bonfire(
         perceptual_roughness: 1.0,
         ..default()
     });
+    let wood = materials.add(StandardMaterial {
+        base_color: Color::srgb(wood_color.x, wood_color.y, wood_color.z),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
 
     let ring_mesh = meshes.add(Cylinder::new(0.70, 0.25).mesh().resolution(8));
     let coal_mesh = meshes.add(Sphere::new(0.18).mesh().ico(1).unwrap());
     let log_mesh = meshes.add(Capsule3d::new(0.08, 0.50).mesh().longitudes(5).latitudes(4));
     let ember_mesh = meshes.add(Sphere::new(0.10).mesh().ico(1).unwrap());
+    let flame_mesh = meshes.add(
+        ConicalFrustum {
+            radius_top: 0.02,
+            radius_bottom: 0.22,
+            height: 0.70,
+        }
+        .mesh()
+        .resolution(6),
+    );
+    let flame_small_mesh = meshes.add(
+        ConicalFrustum {
+            radius_top: 0.01,
+            radius_bottom: 0.14,
+            height: 0.45,
+        }
+        .mesh()
+        .resolution(5),
+    );
+
+    // Add collision segment (blocks movement but not line-of-sight)
+    wall_segments.push(WallSegment {
+        center: Vec2::new(center.x, center.z),
+        half_extents: Vec2::splat(BONFIRE_COLLISION_RADIUS),
+        blocks_los: false,
+    });
 
     commands
         .spawn((
             Bonfire { lit: true },
+            tilemap::Obstacle,
+            tilemap::ObstacleCollider {
+                half_x: BONFIRE_COLLISION_RADIUS,
+                half_z: BONFIRE_COLLISION_RADIUS,
+            },
             Transform::from_translation(center),
             Visibility::Visible,
         ))
@@ -207,11 +259,11 @@ fn spawn_bonfire(
 
             // Logs (crossed)
             for angle in [0.0_f32, 1.1, 2.3, 3.6] {
-                let x = angle.cos() * 0.15;
-                let z = angle.sin() * 0.15;
+                let x = angle.cos() * 0.20;
+                let z = angle.sin() * 0.20;
                 parent.spawn((
                     Mesh3d(log_mesh.clone()),
-                    MeshMaterial3d(stone.clone()),
+                    MeshMaterial3d(wood.clone()),
                     Transform::from_xyz(x, 0.35, z)
                         .with_rotation(
                             Quat::from_rotation_y(angle) * Quat::from_rotation_z(0.45),
@@ -219,7 +271,7 @@ fn spawn_bonfire(
                 ));
             }
 
-            // Glowing embers
+            // Glowing embers in the coals
             for (dx, dz) in [(0.0, 0.0), (0.12, 0.08), (-0.10, 0.06), (0.05, -0.11)] {
                 parent.spawn((
                     Mesh3d(ember_mesh.clone()),
@@ -228,16 +280,35 @@ fn spawn_bonfire(
                 ));
             }
 
+            // Flame shapes (visible fire)
+            parent.spawn((
+                Mesh3d(flame_mesh.clone()),
+                MeshMaterial3d(flame.clone()),
+                Transform::from_xyz(0.0, 0.60, 0.0),
+            ));
+            parent.spawn((
+                Mesh3d(flame_small_mesh.clone()),
+                MeshMaterial3d(flame.clone()),
+                Transform::from_xyz(0.14, 0.50, 0.06)
+                    .with_rotation(Quat::from_rotation_z(0.15)),
+            ));
+            parent.spawn((
+                Mesh3d(flame_small_mesh.clone()),
+                MeshMaterial3d(flame.clone()),
+                Transform::from_xyz(-0.10, 0.48, -0.08)
+                    .with_rotation(Quat::from_rotation_z(-0.20)),
+            ));
+
             // Point light for the fire glow
             parent.spawn((
                 PointLight {
                     color: Color::srgb(1.0, 0.6, 0.2),
-                    intensity: 8_000.0,
-                    range: 12.0,
+                    intensity: 15_000.0,
+                    range: 16.0,
                     shadows_enabled: false,
                     ..default()
                 },
-                Transform::from_xyz(0.0, 1.0, 0.0),
+                Transform::from_xyz(0.0, 1.2, 0.0),
             ));
         });
 }

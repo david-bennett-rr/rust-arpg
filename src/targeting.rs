@@ -262,7 +262,7 @@ fn target_visible_from_player(
     target_translation: Vec3,
     wall_index: &WallSpatialIndex,
 ) -> bool {
-    wall_index.segment_clear(
+    wall_index.segment_clear_los(
         Vec2::new(player_translation.x, player_translation.z),
         Vec2::new(target_translation.x, target_translation.z),
         0.0,
@@ -419,6 +419,7 @@ mod tests {
         wall_index.rebuild(vec![WallSegment {
             center: Vec2::new(5.0, 0.0),
             half_extents: Vec2::new(1.0, 1.0),
+            blocks_los: true,
         }]);
 
         assert!(!target_visible_from_player(
@@ -434,6 +435,7 @@ mod tests {
         wall_index.rebuild(vec![WallSegment {
             center: Vec2::new(5.0, 3.0),
             half_extents: Vec2::new(1.0, 1.0),
+            blocks_los: true,
         }]);
 
         assert!(target_visible_from_player(

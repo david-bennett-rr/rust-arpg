@@ -114,6 +114,7 @@ impl FloorSceneAssets {
 pub struct WallSegment {
     pub(crate) center: Vec2,
     pub(crate) half_extents: Vec2,
+    pub(crate) blocks_los: bool,
 }
 
 #[derive(Resource)]
@@ -152,8 +153,50 @@ impl WallSpatialIndex {
         }
     }
 
+    #[allow(dead_code)]
     pub fn segment_clear(&self, start: Vec2, end: Vec2, radius: f32) -> bool {
         self.first_hit_fraction(start, end, radius).is_none()
+    }
+
+    pub fn segment_clear_los(&self, start: Vec2, end: Vec2, radius: f32) -> bool {
+        self.first_hit_fraction_los(start, end, radius).is_none()
+    }
+
+    pub fn first_hit_fraction_los(&self, start: Vec2, end: Vec2, radius: f32) -> Option<f32> {
+        let min = start.min(end) - Vec2::splat(radius);
+        let max = start.max(end) + Vec2::splat(radius);
+        let (min_cell, max_cell) = self.cell_range(min, max);
+        let mut best_hit: Option<f32> = None;
+
+        for x in min_cell.x..=max_cell.x {
+            for z in min_cell.y..=max_cell.y {
+                let Some(indices) = self.cells.get(&IVec2::new(x, z)) else {
+                    continue;
+                };
+
+                for &index in indices {
+                    let segment = &self.segments[index];
+                    if !segment.blocks_los {
+                        continue;
+                    }
+                    let Some(hit_fraction) = segment_aabb_intersection_fraction(
+                        start,
+                        end,
+                        segment.center,
+                        segment.half_extents + Vec2::splat(radius),
+                    ) else {
+                        continue;
+                    };
+
+                    best_hit = Some(match best_hit {
+                        Some(best) => best.min(hit_fraction),
+                        None => hit_fraction,
+                    });
+                }
+            }
+        }
+
+        best_hit
     }
 
     pub fn first_hit_fraction(&self, start: Vec2, end: Vec2, radius: f32) -> Option<f32> {
@@ -298,7 +341,7 @@ pub fn sweep_ground_target<'a, I>(
     clearance: f32,
 ) -> Vec2
 where
-    I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
+    I: IntoIterator<Item = (&'a Transform, &'a ObstacleCollider)>,
 {
     let clamped_end = clamp_ground_target(bounds, desired_end, radius);
     clip_segment_to_walls(start, clamped_end, radius, walls, clearance)
@@ -325,7 +368,7 @@ pub fn clip_segment_to_walls<'a, I>(
     clearance: f32,
 ) -> Vec2
 where
-    I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
+    I: IntoIterator<Item = (&'a Transform, &'a ObstacleCollider)>,
 {
     let delta = end - start;
     let length = delta.length();
@@ -365,7 +408,7 @@ pub fn clip_segment_to_wall_index(
 #[allow(dead_code)]
 pub fn segment_clear_of_walls<'a, I>(start: Vec2, end: Vec2, radius: f32, walls: I) -> bool
 where
-    I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
+    I: IntoIterator<Item = (&'a Transform, &'a ObstacleCollider)>,
 {
     first_wall_hit_fraction(start, end, radius, walls).is_none()
 }
@@ -376,13 +419,13 @@ pub fn segment_clear_with_index(
     radius: f32,
     wall_index: &WallSpatialIndex,
 ) -> bool {
-    wall_index.segment_clear(start, end, radius)
+    wall_index.segment_clear_los(start, end, radius)
 }
 
 #[allow(dead_code)]
 pub fn first_wall_hit_fraction<'a, I>(start: Vec2, end: Vec2, radius: f32, walls: I) -> Option<f32>
 where
-    I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
+    I: IntoIterator<Item = (&'a Transform, &'a ObstacleCollider)>,
 {
     let mut best_hit: Option<f32> = None;
 
@@ -535,24 +578,24 @@ const WALL_THICKNESS: f32 = 0.3;
 
 /// Marker for wall entities.
 #[derive(Component)]
-pub struct Wall;
+pub struct Obstacle;
 
 /// Axis-aligned collision box for a wall segment (XZ plane).
 #[allow(dead_code)]
 #[derive(Component)]
-pub struct WallCollider {
+pub struct ObstacleCollider {
     pub half_x: f32,
     pub half_z: f32,
 }
 
 type WallCollisionPlayers<'w, 's> =
-    Query<'w, 's, &'static mut Transform, (With<Player>, Without<Wall>, Without<EnemyCollision>)>;
+    Query<'w, 's, &'static mut Transform, (With<Player>, Without<Obstacle>, Without<EnemyCollision>)>;
 
 type WallCollisionEnemies<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static EnemyCollision),
-    (Without<Player>, Without<Wall>),
+    (Without<Player>, Without<Obstacle>),
 >;
 
 /// Spawn walls around the perimeter of a room, with gaps only at doors that
@@ -683,10 +726,11 @@ fn spawn_wall_segment(
     wall_segments.push(WallSegment {
         center: Vec2::new(pos.x, pos.z),
         half_extents: Vec2::new(half_x, half_z),
+        blocks_los: true,
     });
     commands.spawn((
-        Wall,
-        WallCollider { half_x, half_z },
+        Obstacle,
+        ObstacleCollider { half_x, half_z },
         Mesh3d(mesh.clone()),
         MeshMaterial3d(material.visible.clone()),
         FogStatic::edge(
@@ -821,12 +865,12 @@ pub fn resolve_wall_collisions(
 }
 
 #[allow(dead_code)]
-fn push_out_of_wall(translation: &mut Vec3, radius: f32, wall_pos: Vec3, wall: &WallCollider) {
+fn push_out_of_obstacle(translation: &mut Vec3, radius: f32, obstacle_pos: Vec3, obstacle: &ObstacleCollider) {
     push_out_of_wall_segment(
         translation,
         radius,
-        Vec2::new(wall_pos.x, wall_pos.z),
-        Vec2::new(wall.half_x, wall.half_z),
+        Vec2::new(obstacle_pos.x, obstacle_pos.z),
+        Vec2::new(obstacle.half_x, obstacle.half_z),
     );
 }
 
@@ -955,7 +999,7 @@ mod tests {
     #[test]
     fn clip_segment_to_walls_respects_clearance() {
         let wall_tf = Transform::from_xyz(5.0, 0.0, 0.0);
-        let wall = WallCollider {
+        let wall = ObstacleCollider {
             half_x: 1.0,
             half_z: 1.0,
         };
@@ -973,13 +1017,13 @@ mod tests {
 
     #[test]
     fn push_out_of_wall_resolves_embedded_centers() {
-        let wall = WallCollider {
+        let wall = ObstacleCollider {
             half_x: 1.0,
             half_z: 1.0,
         };
         let mut translation = Vec3::new(0.25, 0.0, 0.0);
 
-        push_out_of_wall(&mut translation, 0.75, Vec3::ZERO, &wall);
+        push_out_of_obstacle(&mut translation, 0.75, Vec3::ZERO, &wall);
 
         assert!(translation.x >= wall.half_x + 0.75);
         assert_eq!(translation.z, 0.0);
@@ -992,19 +1036,21 @@ mod tests {
             WallSegment {
                 center: Vec2::new(5.0, 0.0),
                 half_extents: Vec2::new(1.0, 1.0),
+                blocks_los: true,
             },
             WallSegment {
                 center: Vec2::new(12.0, 3.0),
                 half_extents: Vec2::new(1.0, 1.0),
+                blocks_los: true,
             },
         ]);
         let wall_a_tf = Transform::from_xyz(5.0, 0.0, 0.0);
         let wall_b_tf = Transform::from_xyz(12.0, 0.0, 3.0);
-        let wall_a = WallCollider {
+        let wall_a = ObstacleCollider {
             half_x: 1.0,
             half_z: 1.0,
         };
-        let wall_b = WallCollider {
+        let wall_b = ObstacleCollider {
             half_x: 1.0,
             half_z: 1.0,
         };
