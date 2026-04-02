@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use crate::combat::{game_running, smoothstep01, DamageRng, HitFlash, HitPoints, StunMeter};
 use crate::player::{
-    visual_forward, Dodge, Player, PlayerCombat, PlayerSet, PLAYER_COLLISION_RADIUS,
+    visual_forward, AttackKind, Dodge, Player, PlayerCombat, PlayerSet, PLAYER_COLLISION_RADIUS,
 };
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::tilemap::{clamp_translation, FloorBounds};
@@ -94,6 +94,11 @@ pub(crate) struct EnemyCollision {
 #[derive(Component)]
 pub(crate) struct UniqueEnemyMaterials;
 
+#[derive(Component, Default, Clone)]
+pub(crate) struct UniqueEnemyMaterialCache {
+    pub(crate) handles: SmallVec<[Handle<StandardMaterial>; 8]>,
+}
+
 type CollisionPlayer<'w> =
     Single<'w, (&'static mut Transform, &'static Dodge), (With<Player>, Without<EnemyCollision>)>;
 
@@ -132,6 +137,12 @@ const PLAYER_SLASH_ARC_DOT: f32 = 0.08;
 const COLLISION_EPSILON: f32 = 0.001;
 const ENEMY_COLLISION_CELL_SIZE: f32 = 2.0;
 
+#[derive(Default)]
+struct EnemyCollisionScratch {
+    enemy_cells: HashMap<IVec2, SmallVec<[Entity; 8]>>,
+    enemy_snapshots: SmallVec<[(Entity, Vec2); 16]>,
+}
+
 pub(crate) fn build_player_slash_state<'a>(
     transform: &Transform,
     combat: &'a PlayerCombat,
@@ -165,7 +176,10 @@ pub(crate) fn try_player_slash(
     if distance <= PLAYER_SLASH_RANGE && direction.dot(player_slash.forward) >= PLAYER_SLASH_ARC_DOT
     {
         *target.last_hit_swing_id = player_slash.combat.swing_id;
-        let damage = damage_rng.roll_1d5();
+        let damage = match player_slash.combat.attack_kind {
+            AttackKind::Light => damage_rng.roll_light(),
+            AttackKind::Heavy => damage_rng.roll_heavy(),
+        };
         if target.health.apply_damage(damage) > 0 {
             target.stun.apply_stun_damage(damage as f32);
             target.flash.trigger();
@@ -195,6 +209,7 @@ fn resolve_actor_collisions(
     mut player: CollisionPlayer<'_>,
     enemy_entities: Query<Entity, With<EnemyCollision>>,
     mut enemy_transforms: EnemyActors<'_, '_>,
+    mut scratch: Local<EnemyCollisionScratch>,
 ) {
     let (ref mut player_tf, dodge) = *player;
     let mut player_ground = horizontal_position(player_tf.translation);
@@ -226,26 +241,28 @@ fn resolve_actor_collisions(
         }
     }
 
-    let mut enemy_cells: HashMap<IVec2, SmallVec<[Entity; 8]>> = HashMap::new();
-    let mut enemy_snapshots: SmallVec<[(Entity, Vec2); 16]> = SmallVec::new();
+    scratch.enemy_cells.clear();
+    scratch.enemy_snapshots.clear();
     for enemy_id in &enemy_ids {
         let Ok((_, enemy_transform)) = enemy_transforms.get_mut(*enemy_id) else {
             continue;
         };
         let position = horizontal_position(enemy_transform.translation);
-        enemy_cells
+        scratch
+            .enemy_cells
             .entry(enemy_collision_cell(position))
             .or_default()
             .push(*enemy_id);
-        enemy_snapshots.push((*enemy_id, position));
+        scratch.enemy_snapshots.push((*enemy_id, position));
     }
 
-    for (enemy_id, position) in enemy_snapshots {
+    for &(enemy_id, position) in &scratch.enemy_snapshots {
         let center_cell = enemy_collision_cell(position);
 
         for dx in -1..=1 {
             for dz in -1..=1 {
-                let Some(cell_enemies) = enemy_cells.get(&(center_cell + IVec2::new(dx, dz)))
+                let Some(cell_enemies) =
+                    scratch.enemy_cells.get(&(center_cell + IVec2::new(dx, dz)))
                 else {
                     continue;
                 };
@@ -284,13 +301,15 @@ fn resolve_actor_collisions(
 }
 
 fn instance_enemy_materials(
+    mut commands: Commands,
     roots: Query<Entity, Added<UniqueEnemyMaterials>>,
     children_query: Query<&Children>,
     mut material_query: Query<&mut MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for root in &roots {
-        let mut stack = vec![root];
+        let mut stack = SmallVec::<[Entity; 32]>::new();
+        stack.push(root);
         let mut cloned_handles: HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>> =
             HashMap::new();
 
@@ -315,6 +334,12 @@ fn instance_enemy_materials(
                 stack.extend(children.iter().copied());
             }
         }
+
+        let mut handles = SmallVec::<[Handle<StandardMaterial>; 8]>::new();
+        handles.extend(cloned_handles.into_values());
+        commands
+            .entity(root)
+            .insert(UniqueEnemyMaterialCache { handles });
     }
 }
 

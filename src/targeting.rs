@@ -1,8 +1,10 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use smallvec::SmallVec;
 
 use crate::camera::MainCamera;
 use crate::combat::{HitPoints, StunMeter};
+use crate::enemy::UniqueEnemyMaterialCache;
 use crate::hud::PauseMenuState;
 use crate::player::{Player, PlayerSet};
 use crate::world::tilemap::WallSpatialIndex;
@@ -66,7 +68,12 @@ struct TargetPanel;
 type TargetableQuery<'w, 's> = Query<
     'w,
     's,
-    (&'static Targetable, &'static HitPoints, &'static StunMeter, &'static Visibility),
+    (
+        &'static Targetable,
+        &'static HitPoints,
+        &'static StunMeter,
+        &'static Visibility,
+    ),
     (With<Targetable>, Without<TargetPanel>),
 >;
 
@@ -284,37 +291,63 @@ fn update_highlight_glow(
 }
 
 fn apply_highlight_emissive(
-    glows: Query<(Entity, &HighlightGlow), Changed<HighlightGlow>>,
+    glows: Query<
+        (Entity, &HighlightGlow, Option<&UniqueEnemyMaterialCache>),
+        Changed<HighlightGlow>,
+    >,
     children_query: Query<&Children>,
     material_query: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (entity, glow) in &glows {
+    for (entity, glow, material_cache) in &glows {
         let intensity = glow.amount * 0.8;
-        set_emissive_recursive(
-            entity,
-            LinearRgba::new(intensity, intensity, intensity, 1.0),
-            &children_query,
-            &material_query,
-            &mut materials,
-        );
+        let emissive = LinearRgba::new(intensity, intensity, intensity, 1.0);
+        if let Some(material_cache) = material_cache {
+            set_emissive_cached(&material_cache.handles, emissive, &mut materials);
+        } else {
+            set_emissive_recursive(
+                entity,
+                emissive,
+                &children_query,
+                &material_query,
+                &mut materials,
+            );
+        }
     }
 }
 
 fn clear_removed_highlight_emissive(
     mut removed_glows: RemovedComponents<HighlightGlow>,
+    material_caches: Query<&UniqueEnemyMaterialCache>,
     children_query: Query<&Children>,
     material_query: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for entity in removed_glows.read() {
-        set_emissive_recursive(
-            entity,
-            LinearRgba::new(0.0, 0.0, 0.0, 1.0),
-            &children_query,
-            &material_query,
-            &mut materials,
-        );
+        let emissive = LinearRgba::new(0.0, 0.0, 0.0, 1.0);
+        if let Ok(material_cache) = material_caches.get(entity) {
+            set_emissive_cached(&material_cache.handles, emissive, &mut materials);
+        } else {
+            set_emissive_recursive(
+                entity,
+                emissive,
+                &children_query,
+                &material_query,
+                &mut materials,
+            );
+        }
+    }
+}
+
+fn set_emissive_cached(
+    handles: &[Handle<StandardMaterial>],
+    emissive: LinearRgba,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    for handle in handles {
+        if let Some(mat) = materials.get_mut(handle) {
+            mat.emissive = emissive;
+        }
     }
 }
 
@@ -325,7 +358,8 @@ fn set_emissive_recursive(
     material_query: &Query<&MeshMaterial3d<StandardMaterial>>,
     materials: &mut Assets<StandardMaterial>,
 ) {
-    let mut stack = vec![entity];
+    let mut stack = SmallVec::<[Entity; 16]>::new();
+    stack.push(entity);
     while let Some(current) = stack.pop() {
         if let Ok(mat_handle) = material_query.get(current) {
             if let Some(mat) = materials.get_mut(&mat_handle.0) {

@@ -4,11 +4,11 @@ use bevy::{input::gamepad::Gamepad, prelude::*};
 use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
 use crate::player::{
-    AttackLunge, ControllerMove, DeathAnim, Dodge, KnightAnimator, MoveTarget, Player,
-    PlayerCombat, PlayerSet, PlayerStats,
+    AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, KnightAnimator, MoveTarget,
+    Player, PlayerCombat, PlayerSet, PlayerStats,
 };
 use crate::targeting::TargetState;
-use crate::world::floor::FloorMap;
+use crate::world::Bonfire;
 
 const BAR_WIDTH: f32 = 220.0;
 const BAR_HEIGHT: f32 = 14.0;
@@ -20,13 +20,52 @@ const HP_COLOR: Color = Color::srgb(0.7, 0.12, 0.12);
 const HP_BG: Color = Color::srgb(0.18, 0.04, 0.04);
 const STAMINA_COLOR: Color = Color::srgb(0.22, 0.6, 0.18);
 const STAMINA_BG: Color = Color::srgb(0.06, 0.14, 0.05);
+const BAR_FLASH_DURATION: f32 = 0.25;
+
+const DEATH_TEXT_DELAY: f32 = 0.5;
+const DEATH_FADE_OUT_DURATION: f32 = 2.0;
+const DEATH_FADE_IN_DURATION: f32 = 1.5;
+
+#[derive(Event)]
+pub struct StaminaFlashEvent;
+
+#[derive(Resource)]
+pub struct LastBonfirePosition(pub Vec3);
+
+impl Default for LastBonfirePosition {
+    fn default() -> Self {
+        Self(Vec3::ZERO)
+    }
+}
+
+#[derive(Default)]
+enum DeathPhase {
+    #[default]
+    Alive,
+    /// Death anim playing, waiting for it to finish
+    Dying,
+    /// "YOU DIED" text visible, fading to black
+    FadeOut(f32),
+    /// Fully black, respawning
+    Respawn,
+    /// Fading back in at bonfire
+    FadeIn(f32),
+}
+
+#[derive(Resource, Default)]
+struct DeathRespawnState {
+    phase: DeathPhase,
+}
 
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PauseMenuState>()
-            .add_systems(Startup, (spawn_hud, spawn_pause_menu, spawn_death_screen))
+            .init_resource::<LastBonfirePosition>()
+            .init_resource::<DeathRespawnState>()
+            .add_event::<StaminaFlashEvent>()
+            .add_systems(Startup, (spawn_hud, spawn_pause_menu, spawn_death_screen, init_bonfire_position))
             .add_systems(
                 PreUpdate,
                 (
@@ -40,12 +79,12 @@ impl Plugin for HudPlugin {
                 Update,
                 (
                     update_hud,
+                    flash_hud_bars,
                     sync_pause_menu_visibility,
-                    check_death,
+                    death_respawn_sequence,
                     (
                         handle_pause_menu_click,
                         sync_pause_menu_buttons,
-                        handle_restart_click,
                     )
                         .chain()
                         .before(PlayerSet::Update),
@@ -119,11 +158,42 @@ impl PauseMenuState {
 #[derive(Component)]
 struct HudBarFill(BarKind);
 
+#[derive(Component)]
+struct BarFlash {
+    timer: Timer,
+    base_color: Color,
+}
+
+impl BarFlash {
+    fn new(base_color: Color) -> Self {
+        let mut timer = Timer::from_seconds(BAR_FLASH_DURATION, TimerMode::Once);
+        timer.tick(std::time::Duration::from_secs_f32(BAR_FLASH_DURATION));
+        Self { timer, base_color }
+    }
+
+    fn trigger(&mut self) {
+        self.timer.reset();
+    }
+
+    fn amount(&self) -> f32 {
+        if self.timer.finished() {
+            return 0.0;
+        }
+        let duration = self.timer.duration().as_secs_f32().max(0.001);
+        (1.0 - self.timer.elapsed_secs() / duration).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BarKind {
     Health,
     Stamina,
 }
+
+const FLASK_COLOR: Color = Color::srgb(0.85, 0.55, 0.12);
+
+#[derive(Component)]
+struct FlaskChargeText;
 
 fn spawn_hud(mut commands: Commands) {
     commands
@@ -131,13 +201,52 @@ fn spawn_hud(mut commands: Commands) {
             position_type: PositionType::Absolute,
             left: Val::Px(BAR_LEFT),
             top: Val::Px(BAR_TOP),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(BAR_GAP),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
             ..default()
         })
         .with_children(|parent| {
-            spawn_bar(parent, BarKind::Health, HP_COLOR, HP_BG);
-            spawn_bar(parent, BarKind::Stamina, STAMINA_COLOR, STAMINA_BG);
+            // Flask icon + charge count
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|flask_col| {
+                    // Bottle shape (a colored rectangle as a simple icon)
+                    flask_col.spawn((
+                        Node {
+                            width: Val::Px(18.0),
+                            height: Val::Px(24.0),
+                            ..default()
+                        },
+                        BackgroundColor(FLASK_COLOR),
+                    ));
+                    // Charge count
+                    flask_col.spawn((
+                        FlaskChargeText,
+                        Text::new("3"),
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(FLASK_COLOR),
+                    ));
+                });
+
+            // Bars
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(BAR_GAP),
+                    ..default()
+                })
+                .with_children(|bar_col| {
+                    spawn_bar(bar_col, BarKind::Health, HP_COLOR, HP_BG);
+                    spawn_bar(bar_col, BarKind::Stamina, STAMINA_COLOR, STAMINA_BG);
+                });
         });
 }
 
@@ -152,6 +261,7 @@ fn spawn_bar(parent: &mut ChildBuilder, kind: BarKind, fill_color: Color, bg_col
         .with_children(|bar| {
             bar.spawn((
                 HudBarFill(kind),
+                BarFlash::new(fill_color),
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Percent(100.0),
@@ -162,14 +272,16 @@ fn spawn_bar(parent: &mut ChildBuilder, kind: BarKind, fill_color: Color, bg_col
         });
 }
 
+#[allow(clippy::type_complexity)]
 fn update_hud(
-    player: Option<Single<(&HitPoints, &PlayerStats), With<Player>>>,
+    player: Option<Single<(&HitPoints, &PlayerStats, &HealingFlask), With<Player>>>,
     mut fills: Query<(&HudBarFill, &mut Node)>,
+    mut flask_text: Single<&mut Text, With<FlaskChargeText>>,
 ) {
     let Some(player) = player else {
         return;
     };
-    let (hp, stats) = *player;
+    let (hp, stats, flask) = *player;
 
     for (bar, mut node) in &mut fills {
         let pct = match bar.0 {
@@ -177,6 +289,44 @@ fn update_hud(
             BarKind::Stamina => stats.stamina / stats.max_stamina,
         };
         node.width = Val::Percent(pct.clamp(0.0, 1.0) * 100.0);
+    }
+
+    flask_text.0 = format!("{}", flask.charges);
+}
+
+fn flash_hud_bars(
+    time: Res<Time>,
+    player: Option<Single<&HitFlash, With<Player>>>,
+    mut stamina_events: EventReader<StaminaFlashEvent>,
+    mut fills: Query<(&HudBarFill, &mut BarFlash, &mut BackgroundColor)>,
+) {
+    let hp_hit = player.is_some_and(|p| p.amount() > 0.5);
+    let stamina_fail = !stamina_events.is_empty();
+    stamina_events.clear();
+
+    for (bar, mut flash, mut bg) in &mut fills {
+        match bar.0 {
+            BarKind::Health if hp_hit => flash.trigger(),
+            BarKind::Stamina if stamina_fail => flash.trigger(),
+            _ => {}
+        }
+
+        flash.timer.tick(time.delta());
+
+        let amount = flash.amount();
+        if amount > 0.0 {
+            let flash_color = Color::WHITE;
+            let base = flash.base_color.to_srgba();
+            let white = flash_color.to_srgba();
+            let blend = amount * 0.6;
+            *bg = BackgroundColor(Color::srgb(
+                base.red + (white.red - base.red) * blend,
+                base.green + (white.green - base.green) * blend,
+                base.blue + (white.blue - base.blue) * blend,
+            ));
+        } else {
+            *bg = BackgroundColor(flash.base_color);
+        }
     }
 }
 
@@ -188,20 +338,13 @@ fn update_hud(
 struct DeathScreen;
 
 #[derive(Component)]
-struct RestartButton;
+struct DeathText;
 
 #[derive(Component)]
 struct PauseMenu;
 
 #[derive(Component, Clone, Copy)]
 struct PauseMenuButton(PauseMenuAction);
-
-type RestartButtonInteractions<'w, 's> = Query<
-    'w,
-    's,
-    (&'static Interaction, &'static mut BackgroundColor),
-    (Changed<Interaction>, With<RestartButton>),
->;
 
 type PauseMenuButtonInteractions<'w, 's> = Query<
     'w,
@@ -215,6 +358,7 @@ type DeathScreenVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility,
 type PauseMenuVisibilityQuery<'w, 's> =
     Query<'w, 's, &'static mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>;
 
+#[allow(clippy::type_complexity)]
 type RestartPlayer<'w> = Option<
     Single<
         'w,
@@ -225,6 +369,7 @@ type RestartPlayer<'w> = Option<
             &'static mut PlayerCombat,
             &'static mut AttackLunge,
             &'static mut Dodge,
+            &'static mut HealingFlask,
             &'static mut MoveTarget,
             &'static mut ControllerMove,
             &'static mut DeathAnim,
@@ -245,7 +390,7 @@ struct RestartContext<'w, 's> {
     target_state: ResMut<'w, TargetState>,
     respawn_event: EventWriter<'w, RespawnEnemies>,
     exit_event: EventWriter<'w, AppExit>,
-    floor_map: Option<Res<'w, FloorMap>>,
+    last_bonfire: Res<'w, LastBonfirePosition>,
 }
 
 impl RestartContext<'_, '_> {
@@ -267,12 +412,16 @@ impl RestartContext<'_, '_> {
     }
 
     fn restart_level(&mut self) {
-        self.game_over.0 = false;
-        self.pause_menu.close();
-
         for mut visibility in &mut self.death_screen {
             *visibility = Visibility::Hidden;
         }
+        self.respawn_at_bonfire(self.last_bonfire.0);
+    }
+
+    fn respawn_at_bonfire(&mut self, bonfire_pos: Vec3) {
+        self.game_over.0 = false;
+        self.pause_menu.close();
+
         for mut visibility in &mut self.pause_menu_visibility {
             *visibility = Visibility::Hidden;
         }
@@ -285,23 +434,21 @@ impl RestartContext<'_, '_> {
                 ref mut combat,
                 ref mut attack_lunge,
                 ref mut dodge,
+                ref mut flask,
                 ref mut move_target,
                 ref mut controller_move,
                 ref mut death_anim,
                 ref mut animator,
                 ref mut flash,
             ) = **player;
-            transform.translation = self
-                .floor_map
-                .as_ref()
-                .map(|fm| fm.rooms[fm.start_room].world_center)
-                .unwrap_or(Vec3::ZERO);
+            transform.translation = bonfire_pos;
             transform.rotation = Quat::IDENTITY;
             hit_points.heal_to_full();
             **stats = PlayerStats::default();
             **combat = PlayerCombat::default();
             **attack_lunge = AttackLunge::default();
             **dodge = Dodge::default();
+            **flask = HealingFlask::default();
             **controller_move = ControllerMove::default();
             **death_anim = DeathAnim::default();
             **animator = KnightAnimator::default();
@@ -406,70 +553,113 @@ fn spawn_death_screen(mut commands: Commands) {
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(24.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.75)),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
             Visibility::Hidden,
-            // High z-index so it renders on top
             GlobalZIndex(10),
         ))
         .with_children(|parent| {
-            // YOU DIED text
             parent.spawn((
+                DeathText,
                 Text::new("YOU DIED"),
                 TextFont {
                     font_size: 64.0,
                     ..default()
                 },
-                TextColor(Color::srgb(0.7, 0.10, 0.08)),
+                TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0)),
             ));
-
-            // RESTART button
-            parent
-                .spawn((
-                    RestartButton,
-                    Button,
-                    Node {
-                        padding: UiRect::axes(Val::Px(28.0), Val::Px(12.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
-                ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("RESTART"),
-                        TextFont {
-                            font_size: 26.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.85, 0.85, 0.85)),
-                    ));
-                });
         });
 }
 
-fn check_death(
-    mut game_over: ResMut<GameOver>,
-    mut pause_menu: ResMut<PauseMenuState>,
-    player: Option<Single<(&HitPoints, &DeathAnim), With<Player>>>,
-    mut death_screen: Query<&mut Visibility, With<DeathScreen>>,
+fn init_bonfire_position(
+    bonfires: Query<&Transform, With<Bonfire>>,
+    mut last_bonfire: ResMut<LastBonfirePosition>,
 ) {
-    let Some(player) = player else {
-        return;
-    };
-    let (hp, death_anim) = *player;
-
-    // Freeze gameplay immediately on death
-    if hp.is_dead() && !game_over.0 {
-        game_over.0 = true;
-        pause_menu.close();
+    if let Some(tf) = bonfires.iter().next() {
+        last_bonfire.0 = tf.translation;
     }
+}
 
-    // Show death screen only after the fall animation finishes
-    if game_over.0 && death_anim.active && death_anim.timer.finished() {
-        for mut vis in &mut death_screen {
-            *vis = Visibility::Visible;
+#[derive(SystemParam)]
+struct DeathSequenceContext<'w, 's> {
+    time: Res<'w, Time>,
+    game_over: ResMut<'w, GameOver>,
+    pause_menu: ResMut<'w, PauseMenuState>,
+    respawn_state: ResMut<'w, DeathRespawnState>,
+    last_bonfire: Res<'w, LastBonfirePosition>,
+    player_query: Option<Single<'w, (&'static HitPoints, &'static DeathAnim), With<Player>>>,
+    death_screen_vis: Query<'w, 's, &'static mut Visibility, With<DeathScreen>>,
+    death_screen_bg: Query<'w, 's, &'static mut BackgroundColor, With<DeathScreen>>,
+    death_text: Query<'w, 's, &'static mut TextColor, With<DeathText>>,
+    restart: RestartContext<'w, 's>,
+}
+
+fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
+    let delta = ctx.time.delta_secs();
+
+    match ctx.respawn_state.phase {
+        DeathPhase::Alive => {
+            let Some(player) = ctx.player_query else {
+                return;
+            };
+            let (hp, _) = *player;
+            if hp.is_dead() && !ctx.game_over.0 {
+                ctx.game_over.0 = true;
+                ctx.pause_menu.close();
+                ctx.respawn_state.phase = DeathPhase::Dying;
+            }
+        }
+        DeathPhase::Dying => {
+            let Some(player) = ctx.player_query else {
+                return;
+            };
+            let (_, death_anim) = *player;
+            if death_anim.active && death_anim.timer.finished() {
+                for mut vis in &mut ctx.death_screen_vis {
+                    *vis = Visibility::Visible;
+                }
+                ctx.respawn_state.phase = DeathPhase::FadeOut(0.0);
+            }
+        }
+        DeathPhase::FadeOut(ref mut elapsed) => {
+            *elapsed += delta;
+            let text_alpha = if *elapsed < DEATH_TEXT_DELAY {
+                0.0
+            } else {
+                ((*elapsed - DEATH_TEXT_DELAY) / 0.5).clamp(0.0, 1.0)
+            };
+            for mut color in &mut ctx.death_text {
+                *color = TextColor(Color::srgba(0.7, 0.10, 0.08, text_alpha));
+            }
+            let bg_alpha = (*elapsed / DEATH_FADE_OUT_DURATION).clamp(0.0, 1.0);
+            for mut bg in &mut ctx.death_screen_bg {
+                *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, bg_alpha));
+            }
+            if *elapsed >= DEATH_FADE_OUT_DURATION {
+                ctx.respawn_state.phase = DeathPhase::Respawn;
+            }
+        }
+        DeathPhase::Respawn => {
+            for mut color in &mut ctx.death_text {
+                *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
+            }
+            let bonfire_pos = ctx.last_bonfire.0;
+            ctx.restart.respawn_at_bonfire(bonfire_pos);
+            ctx.respawn_state.phase = DeathPhase::FadeIn(0.0);
+        }
+        DeathPhase::FadeIn(ref mut elapsed) => {
+            *elapsed += delta;
+            let alpha = 1.0 - (*elapsed / DEATH_FADE_IN_DURATION).clamp(0.0, 1.0);
+            for mut bg in &mut ctx.death_screen_bg {
+                *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, alpha));
+            }
+            if *elapsed >= DEATH_FADE_IN_DURATION {
+                for mut vis in &mut ctx.death_screen_vis {
+                    *vis = Visibility::Hidden;
+                }
+                ctx.respawn_state.phase = DeathPhase::Alive;
+            }
         }
     }
 }
@@ -615,22 +805,3 @@ fn handle_pause_menu_click(
     }
 }
 
-fn handle_restart_click(
-    mut interaction_query: RestartButtonInteractions<'_, '_>,
-    mut restart: RestartContext<'_, '_>,
-) {
-    for (interaction, mut bg) in &mut interaction_query {
-        match interaction {
-            Interaction::Hovered => {
-                *bg = BackgroundColor(Color::srgb(0.35, 0.35, 0.35));
-            }
-            Interaction::Pressed => {
-                *bg = BackgroundColor(Color::srgb(0.45, 0.45, 0.45));
-                restart.restart_level();
-            }
-            Interaction::None => {
-                *bg = BackgroundColor(Color::srgb(0.25, 0.25, 0.25));
-            }
-        }
-    }
-}

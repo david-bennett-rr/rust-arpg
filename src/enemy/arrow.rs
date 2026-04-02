@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use crate::combat::{HitFlash, HitPoints};
 use crate::player::{Dodge, Player};
 use crate::world::fog::FogDynamic;
-use crate::world::tilemap::{first_wall_hit_fraction, Wall, WallCollider};
+use crate::world::tilemap::WallSpatialIndex;
 
 #[derive(Component)]
 pub struct Arrow {
@@ -32,11 +32,8 @@ type ArrowPlayer<'w> = Single<
     (With<Player>, Without<Arrow>),
 >;
 
-type ArrowWallQuery<'w, 's> =
-    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<Arrow>)>;
-
 const ARROW_SPEED: f32 = 6.0;
-const ARROW_DAMAGE: i32 = 2;
+const ARROW_DAMAGE: i32 = 5;
 const ARROW_LIFETIME: f32 = 4.0;
 const ARROW_HIT_RADIUS: f32 = 0.5;
 const ARROW_WALL_RADIUS: f32 = 0.08;
@@ -107,8 +104,8 @@ pub(super) fn spawn_arrow(
 pub(super) fn update_arrows(
     mut commands: Commands,
     time: Res<Time>,
+    wall_index: Res<WallSpatialIndex>,
     mut player: ArrowPlayer<'_>,
-    walls: ArrowWallQuery<'_, '_>,
     mut arrows: Query<(Entity, &mut Arrow, &mut Transform), Without<Player>>,
 ) {
     let delta = time.delta_secs();
@@ -128,7 +125,7 @@ pub(super) fn update_arrows(
         let start_2d = Vec2::new(start.x, start.z);
         let end_2d = Vec2::new(end.x, end.z);
 
-        let wall_hit = first_wall_hit_fraction(start_2d, end_2d, ARROW_WALL_RADIUS, walls.iter());
+        let wall_hit = wall_index.first_hit_fraction(start_2d, end_2d, ARROW_WALL_RADIUS);
         let player_hit = player_contact_fraction(start, end, player_ground);
 
         match resolve_arrow_impact(wall_hit, player_hit, player_dodge.active) {

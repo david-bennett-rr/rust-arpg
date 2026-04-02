@@ -138,7 +138,6 @@ impl LogWriter {
 
         if writeln!(file, "{line}").is_ok() {
             self.bytes_written += line_bytes;
-            let _ = file.flush();
         }
     }
 

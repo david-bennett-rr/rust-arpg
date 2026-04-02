@@ -6,8 +6,8 @@ use crate::combat::{FlashTint, HitFlash, HitPoints};
 use crate::world::floor::FloorMap;
 
 use super::{
-    AttackLunge, ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint,
-    MoveTarget, Player, PlayerCombat, PlayerStats, PLAYER_MAX_HP,
+    AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, JointRest, KnightAnimator,
+    KnightJoint, MoveTarget, Player, PlayerCombat, PlayerStats, PLAYER_MAX_HP,
 };
 
 pub(super) fn spawn_player(
@@ -124,6 +124,7 @@ pub(super) fn spawn_player(
             AttackLunge::default(),
             Dodge::default(),
             PlayerStats::default(),
+            HealingFlask::default(),
             DeathAnim::default(),
             HitPoints::new(PLAYER_MAX_HP),
             HitFlash::default(),

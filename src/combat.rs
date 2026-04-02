@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use smallvec::SmallVec;
 
 use crate::hud::PauseMenuState;
 use crate::rng::SplitMix64;
@@ -173,23 +174,44 @@ fn tick_stun_meters(time: Res<Time>, mut meters: Query<&mut StunMeter>) {
 }
 
 fn update_hit_flash_tints(
-    flashes: Query<&HitFlash>,
+    flashes: Query<(Entity, &HitFlash), Changed<HitFlash>>,
+    children_query: Query<&Children>,
     tint_targets: Query<(&FlashTint, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (tint, material_handle) in &tint_targets {
-        let Ok(flash) = flashes.get(tint.owner) else {
-            continue;
-        };
-        if !flash.dirty {
-            continue;
-        }
-        let amount = flash.amount();
-        let Some(material) = materials.get_mut(&material_handle.0) else {
-            continue;
-        };
+    for (owner, flash) in &flashes {
+        apply_flash_tint_recursive(
+            owner,
+            flash.amount(),
+            &children_query,
+            &tint_targets,
+            &mut materials,
+        );
+    }
+}
 
-        material.base_color = flash_color(tint.base_srgb, amount);
+fn apply_flash_tint_recursive(
+    owner: Entity,
+    amount: f32,
+    children_query: &Query<&Children>,
+    tint_targets: &Query<(&FlashTint, &MeshMaterial3d<StandardMaterial>)>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let mut stack = SmallVec::<[Entity; 16]>::new();
+    stack.push(owner);
+
+    while let Some(entity) = stack.pop() {
+        if let Ok((tint, material_handle)) = tint_targets.get(entity) {
+            if tint.owner == owner {
+                if let Some(material) = materials.get_mut(&material_handle.0) {
+                    material.base_color = flash_color(tint.base_srgb, amount);
+                }
+            }
+        }
+
+        if let Ok(children) = children_query.get(entity) {
+            stack.extend(children.iter().copied());
+        }
     }
 }
 
@@ -203,8 +225,14 @@ fn flash_color(base_srgb: Vec3, amount: f32) -> Color {
 pub struct DamageRng(SplitMix64);
 
 impl DamageRng {
-    pub fn roll_1d5(&mut self) -> i32 {
-        self.0.next_usize(5) as i32 + 1
+    /// Light attack: 1-3 damage.
+    pub fn roll_light(&mut self) -> i32 {
+        self.0.next_usize(3) as i32 + 1
+    }
+
+    /// Heavy attack: 4-8 damage.
+    pub fn roll_heavy(&mut self) -> i32 {
+        self.0.next_usize(5) as i32 + 4
     }
 }
 
@@ -218,11 +246,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn damage_rng_rolls_stay_in_range() {
+    fn light_damage_rolls_stay_in_range() {
         let mut rng = DamageRng(SplitMix64::new(123));
 
         for _ in 0..32 {
-            assert!((1..=5).contains(&rng.roll_1d5()));
+            assert!((1..=3).contains(&rng.roll_light()));
+        }
+    }
+
+    #[test]
+    fn heavy_damage_rolls_stay_in_range() {
+        let mut rng = DamageRng(SplitMix64::new(123));
+
+        for _ in 0..32 {
+            assert!((4..=8).contains(&rng.roll_heavy()));
         }
     }
 

@@ -13,7 +13,7 @@ use bevy::{
 };
 
 use crate::combat::smoothstep01;
-use crate::enemy::UniqueEnemyMaterials;
+use crate::enemy::UniqueEnemyMaterialCache;
 use crate::player::Player;
 use crate::targeting::TargetState;
 
@@ -79,11 +79,15 @@ impl FogStatic {
 #[derive(Component, Debug, Clone, Copy)]
 pub(crate) struct FogDynamic {
     alpha: f32,
+    applied_alpha: u8,
 }
 
 impl Default for FogDynamic {
     fn default() -> Self {
-        Self { alpha: 0.0 }
+        Self {
+            alpha: 0.0,
+            applied_alpha: 0,
+        }
     }
 }
 
@@ -101,6 +105,7 @@ pub(crate) struct FogOverlay {
     memory_world_min: Vec2,
     memory_world_size: Vec2,
     memory_alpha: Vec<f32>,
+    memory_horizontal: Vec<f32>,
     visible_previous_image: Handle<Image>,
     visible_current_image: Handle<Image>,
     visible_size: UVec2,
@@ -108,7 +113,11 @@ pub(crate) struct FogOverlay {
     visible_current_world_min: Vec2,
     visible_world_size: Vec2,
     visible_transition: f32,
+    visible_alpha: Vec<f32>,
+    visible_scratch: Vec<f32>,
+    visible_horizontal: Vec<f32>,
     memory_target_alpha: Vec<f32>,
+    memory_scratch: Vec<f32>,
     explored: Vec<bool>,
 }
 
@@ -206,6 +215,7 @@ pub(crate) fn spawn_fog_overlay(
         memory_world_min,
         memory_world_size,
         memory_alpha: vec![1.0; (memory_size.x * memory_size.y) as usize],
+        memory_horizontal: vec![0.0; (memory_size.x * memory_size.y) as usize],
         visible_previous_image: visible_previous_image_handle,
         visible_current_image: visible_current_image_handle,
         visible_size,
@@ -213,7 +223,11 @@ pub(crate) fn spawn_fog_overlay(
         visible_current_world_min: visible_world_min,
         visible_world_size,
         visible_transition: 1.0,
+        visible_alpha: vec![1.0; (visible_size.x * visible_size.y) as usize],
+        visible_scratch: vec![0.0; (visible_size.x * visible_size.y) as usize],
+        visible_horizontal: vec![0.0; (visible_size.x * visible_size.y) as usize],
         memory_target_alpha: vec![1.0; (memory_size.x * memory_size.y) as usize],
+        memory_scratch: vec![0.0; (memory_size.x * memory_size.y) as usize],
         explored: vec![false; (memory_size.x * memory_size.y) as usize],
     });
 
@@ -265,7 +279,7 @@ pub(crate) fn update_static_fog(
             overlay.visible_size,
         );
 
-        let mut target_visible_alpha = vec![1.0_f32; visible_width * visible_height];
+        overlay.visible_alpha.fill(1.0);
         for y in 0..visible_height {
             for x in 0..visible_width {
                 let idx = y * visible_width + x;
@@ -284,12 +298,25 @@ pub(crate) fn update_static_fog(
                     }
                 }
 
-                target_visible_alpha[idx] = 1.0 - visible_strength;
+                overlay.visible_alpha[idx] = 1.0 - visible_strength;
             }
         }
 
-        for _ in 0..FOG_BLUR_PASSES {
-            target_visible_alpha = blur_alpha(&target_visible_alpha, visible_width, visible_height);
+        {
+            let FogOverlay {
+                visible_alpha,
+                visible_scratch,
+                visible_horizontal,
+                ..
+            } = &mut *overlay;
+            blur_alpha_passes(
+                visible_alpha,
+                visible_scratch,
+                visible_horizontal,
+                visible_width,
+                visible_height,
+                FOG_BLUR_PASSES,
+            );
         }
 
         if initializing {
@@ -298,16 +325,12 @@ pub(crate) fn update_static_fog(
             write_alpha_image(
                 &mut images,
                 &overlay.visible_previous_image,
-                &target_visible_alpha,
-                visible_width,
-                visible_height,
+                &overlay.visible_alpha,
             );
             write_alpha_image(
                 &mut images,
                 &overlay.visible_current_image,
-                &target_visible_alpha,
-                visible_width,
-                visible_height,
+                &overlay.visible_alpha,
             );
             overlay.visible_transition = 1.0;
         } else {
@@ -319,28 +342,38 @@ pub(crate) fn update_static_fog(
             write_alpha_image(
                 &mut images,
                 &overlay.visible_current_image,
-                &target_visible_alpha,
-                visible_width,
-                visible_height,
+                &overlay.visible_alpha,
             );
             overlay.visible_transition = 0.0;
         }
 
         let memory_width = overlay.memory_size.x as usize;
         let memory_height = overlay.memory_size.y as usize;
-        let mut target_memory_alpha = vec![1.0_f32; memory_width * memory_height];
-        for (idx, target) in target_memory_alpha.iter_mut().enumerate() {
-            *target = if overlay.explored[idx] {
+        overlay.memory_target_alpha.fill(1.0);
+        for idx in 0..overlay.memory_target_alpha.len() {
+            overlay.memory_target_alpha[idx] = if overlay.explored[idx] {
                 FOG_EXPLORED_ALPHA
             } else {
                 1.0
             };
         }
 
-        for _ in 0..FOG_MEMORY_BLUR_PASSES {
-            target_memory_alpha = blur_alpha(&target_memory_alpha, memory_width, memory_height);
+        {
+            let FogOverlay {
+                memory_target_alpha,
+                memory_scratch,
+                memory_horizontal,
+                ..
+            } = &mut *overlay;
+            blur_alpha_passes(
+                memory_target_alpha,
+                memory_scratch,
+                memory_horizontal,
+                memory_width,
+                memory_height,
+                FOG_MEMORY_BLUR_PASSES,
+            );
         }
-        overlay.memory_target_alpha = target_memory_alpha;
     }
 
     overlay.visible_transition =
@@ -363,31 +396,19 @@ pub(crate) fn update_static_fog(
         material.visible_current_texture = overlay.visible_current_image.clone();
     }
 
-    let Some(memory_image) = images.get_mut(&overlay.memory_image) else {
-        return;
-    };
-    let memory_width = overlay.memory_size.x as usize;
-    let memory_height = overlay.memory_size.y as usize;
-
     let memory_blend =
         response_blend(FOG_MEMORY_ALPHA_RESPONSE_SPEED, time.delta_secs()).clamp(0.0, 1.0);
+    let mut memory_image_changed = false;
     for idx in 0..overlay.memory_alpha.len() {
         let target = overlay.memory_target_alpha[idx];
         let current = &mut overlay.memory_alpha[idx];
+        let previous_byte = alpha_to_byte(*current);
         *current += (target - *current) * memory_blend;
+        memory_image_changed |= previous_byte != alpha_to_byte(*current);
     }
 
-    for y in 0..memory_height {
-        for x in 0..memory_width {
-            let idx = y * memory_width + x;
-            let pixel = memory_image
-                .pixel_bytes_mut(UVec3::new(x as u32, y as u32, 0))
-                .unwrap();
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-            pixel[3] = (overlay.memory_alpha[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-        }
+    if memory_image_changed {
+        write_alpha_image(&mut images, &overlay.memory_image, &overlay.memory_alpha);
     }
 }
 
@@ -399,7 +420,7 @@ pub(crate) type FoggedQuery<'w, 's> = Query<
         &'static GlobalTransform,
         &'static mut Visibility,
         &'static mut FogDynamic,
-        Has<UniqueEnemyMaterials>,
+        Option<&'static UniqueEnemyMaterialCache>,
     ),
     With<FogDynamic>,
 >;
@@ -411,8 +432,6 @@ pub(crate) struct DynamicFogContext<'w, 's> {
     fog_runtime: Res<'w, FogRuntimeState>,
     wall_index: Res<'w, WallSpatialIndex>,
     target_state: Option<ResMut<'w, TargetState>>,
-    children_query: Query<'w, 's, &'static Children>,
-    material_handles: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     fogged: FoggedQuery<'w, 's>,
 }
@@ -422,11 +441,13 @@ pub(crate) fn update_dynamic_fog(mut ctx: DynamicFogContext<'_, '_>) {
         return;
     };
     let player_ground = horizontal(player.translation);
-    let visibility_origin = ctx.fog_runtime.visible_window_center.unwrap_or(player_ground);
-    let fade_blend =
-        response_blend(FOG_DYNAMIC_FADE_SPEED, ctx.time.delta_secs()).clamp(0.0, 1.0);
+    let visibility_origin = ctx
+        .fog_runtime
+        .visible_window_center
+        .unwrap_or(player_ground);
+    let fade_blend = response_blend(FOG_DYNAMIC_FADE_SPEED, ctx.time.delta_secs()).clamp(0.0, 1.0);
 
-    for (entity, global_transform, mut visibility, mut fog_dynamic, has_unique_materials) in
+    for (entity, global_transform, mut visibility, mut fog_dynamic, material_cache) in
         &mut ctx.fogged
     {
         let target_visible = sample_visible(
@@ -434,21 +455,23 @@ pub(crate) fn update_dynamic_fog(mut ctx: DynamicFogContext<'_, '_>) {
             horizontal(global_transform.translation()),
             &ctx.wall_index,
         );
-        if has_unique_materials {
+        if let Some(material_cache) = material_cache {
             let target_alpha = if target_visible { 1.0 } else { 0.0 };
             fog_dynamic.alpha += (target_alpha - fog_dynamic.alpha) * fade_blend;
             let display_alpha = fog_dynamic.alpha.clamp(0.0, 1.0);
+            let alpha_byte = alpha_to_byte(display_alpha);
 
             if target_visible || display_alpha > FOG_DYNAMIC_HIDDEN_ALPHA {
                 *visibility = Visibility::Visible;
             }
-            apply_fog_alpha_to_entity(
-                entity,
-                display_alpha,
-                &ctx.children_query,
-                &ctx.material_handles,
-                &mut ctx.materials,
-            );
+            if alpha_byte != fog_dynamic.applied_alpha {
+                apply_fog_alpha_to_materials(
+                    &material_cache.handles,
+                    display_alpha,
+                    &mut ctx.materials,
+                );
+                fog_dynamic.applied_alpha = alpha_byte;
+            }
             if !target_visible && display_alpha <= FOG_DYNAMIC_HIDDEN_ALPHA {
                 *visibility = Visibility::Hidden;
             }
@@ -509,28 +532,20 @@ fn new_overlay_image(size: UVec2) -> Image {
     image
 }
 
-fn write_alpha_image(
-    images: &mut Assets<Image>,
-    handle: &Handle<Image>,
-    alpha: &[f32],
-    width: usize,
-    height: usize,
-) {
+fn write_alpha_image(images: &mut Assets<Image>, handle: &Handle<Image>, alpha: &[f32]) {
     let Some(image) = images.get_mut(handle) else {
         return;
     };
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let pixel = image
-                .pixel_bytes_mut(UVec3::new(x as u32, y as u32, 0))
-                .unwrap();
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-            pixel[3] = (alpha[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-        }
+    for (pixel, &value) in image.data.chunks_exact_mut(4).zip(alpha.iter()) {
+        pixel[0] = 0;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        pixel[3] = alpha_to_byte(value);
     }
+}
+
+fn alpha_to_byte(alpha: f32) -> u8 {
+    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn pixel_to_world(world_min: Vec2, world_size: Vec2, size: UVec2, x: u32, y: u32) -> Vec2 {
@@ -586,37 +601,59 @@ fn snap_world_min_to_texels(world_min: Vec2, world_size: Vec2, size: UVec2) -> V
     )
 }
 
-fn apply_fog_alpha_to_entity(
-    root: Entity,
+fn apply_fog_alpha_to_materials(
+    handles: &[Handle<StandardMaterial>],
     alpha: f32,
-    children_query: &Query<&Children>,
-    material_handles: &Query<&MeshMaterial3d<StandardMaterial>>,
     materials: &mut Assets<StandardMaterial>,
 ) {
-    let mut stack = vec![root];
-    while let Some(entity) = stack.pop() {
-        if let Ok(material_handle) = material_handles.get(entity) {
-            let Some(material) = materials.get_mut(&material_handle.0) else {
-                continue;
-            };
-            material.alpha_mode = if alpha < 0.999 {
-                AlphaMode::Blend
-            } else {
-                AlphaMode::Opaque
-            };
-            material.base_color.set_alpha(alpha);
-        }
-
-        if let Ok(children) = children_query.get(entity) {
-            stack.extend(children.iter().copied());
-        }
+    let alpha_mode = if alpha < 0.999 {
+        AlphaMode::Blend
+    } else {
+        AlphaMode::Opaque
+    };
+    for handle in handles {
+        let Some(material) = materials.get_mut(handle) else {
+            continue;
+        };
+        material.alpha_mode = alpha_mode.clone();
+        material.base_color.set_alpha(alpha);
     }
 }
 
-fn blur_alpha(source: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let mut horizontal = vec![0.0; source.len()];
-    let mut out = vec![0.0; source.len()];
+fn blur_alpha_passes(
+    buffer: &mut [f32],
+    scratch: &mut [f32],
+    horizontal: &mut [f32],
+    width: usize,
+    height: usize,
+    passes: usize,
+) {
+    if passes == 0 {
+        return;
+    }
 
+    let mut source_is_buffer = true;
+    for _ in 0..passes {
+        if source_is_buffer {
+            blur_alpha_once(buffer, scratch, horizontal, width, height);
+        } else {
+            blur_alpha_once(scratch, buffer, horizontal, width, height);
+        }
+        source_is_buffer = !source_is_buffer;
+    }
+
+    if !source_is_buffer {
+        buffer.copy_from_slice(scratch);
+    }
+}
+
+fn blur_alpha_once(
+    source: &[f32],
+    out: &mut [f32],
+    horizontal: &mut [f32],
+    width: usize,
+    height: usize,
+) {
     for y in 0..height {
         for x in 0..width {
             let mut total = 0.0;
@@ -656,8 +693,6 @@ fn blur_alpha(source: &[f32], width: usize, height: usize) -> Vec<f32> {
             };
         }
     }
-
-    out
 }
 
 fn sample_visible(player_ground: Vec2, sample: Vec2, wall_index: &WallSpatialIndex) -> bool {
@@ -738,11 +773,13 @@ mod tests {
 
     #[test]
     fn blur_preserves_midtones() {
-        let source = vec![1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0];
-        let blurred = blur_alpha(&source, 3, 3);
+        let mut buffer = vec![1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let mut scratch = vec![0.0; buffer.len()];
+        let mut horizontal = vec![0.0; buffer.len()];
+        blur_alpha_passes(&mut buffer, &mut scratch, &mut horizontal, 3, 3, 1);
 
-        assert!(blurred[4] > 0.0);
-        assert!(blurred[4] < 1.0);
+        assert!(buffer[4] > 0.0);
+        assert!(buffer[4] < 1.0);
     }
 
     #[test]

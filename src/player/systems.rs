@@ -3,17 +3,21 @@ use bevy::window::PrimaryWindow;
 use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::camera::MainCamera;
+use crate::combat::HitPoints;
+use crate::enemy::RespawnEnemies;
+use crate::hud::StaminaFlashEvent;
+use crate::world::Bonfire;
 use crate::targeting::{TargetState, Targetable};
 use crate::world::tilemap::{
-    clamp_ground_target, segment_clear_of_walls, sweep_ground_target, FloorBounds, Wall,
-    WallCollider,
+    clamp_ground_target, segment_clear_with_index, sweep_ground_target_indexed, FloorBounds,
+    WallSpatialIndex,
 };
 
 use super::{
-    dodge_motion_curve, visual_forward, AttackLunge, ControllerMove, Dodge, KnightAnimator,
-    MoveTarget, Player, PlayerCombat, PlayerStats, ARRIVE_THRESHOLD, ATTACK_LUNGE_DURATION,
-    ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP,
-    DODGE_DISTANCE, DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
+    dodge_motion_curve, visual_forward, AttackKind, AttackLunge, ControllerMove, Dodge,
+    HealingFlask, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats, ARRIVE_THRESHOLD,
+    ATTACK_LUNGE_DURATION, ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE, DODGE_DISTANCE,
+    DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
 };
 
 type DodgePlayer<'w> = Single<
@@ -44,9 +48,6 @@ type AttackPlayer<'w> = Single<
     With<Player>,
 >;
 
-type PlayerWallQuery<'w, 's> =
-    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<Player>)>;
-
 type DirectionalTargetables<'w, 's> =
     Query<'w, 's, (Entity, &'static GlobalTransform, &'static Visibility), With<Targetable>>;
 
@@ -61,6 +62,7 @@ pub(super) struct AttackIntent {
     pending_strike: bool,
     holding: bool,
     windup: f32,
+    kind: AttackKind,
 }
 
 #[derive(SystemParam)]
@@ -70,22 +72,23 @@ pub(super) struct AttackControls<'w, 's> {
     gamepads: Query<'w, 's, &'static Gamepad>,
     time: Res<'w, Time>,
     bounds: Res<'w, FloorBounds>,
+    wall_index: Res<'w, WallSpatialIndex>,
 }
 
 #[derive(SystemParam)]
-pub(super) struct ClickContext<'w, 's> {
+pub(super) struct ClickContext<'w> {
     window: Option<Single<'w, &'static Window, With<PrimaryWindow>>>,
     camera_query: Option<Single<'w, (&'static Camera, &'static GlobalTransform), With<MainCamera>>>,
     player_tf: Single<'w, &'static Transform, With<Player>>,
     bounds: Res<'w, FloorBounds>,
-    walls: PlayerWallQuery<'w, 's>,
+    wall_index: Res<'w, WallSpatialIndex>,
 }
 
 #[derive(SystemParam)]
 pub(super) struct ControllerTargetingContext<'w, 's> {
     target_state: ResMut<'w, TargetState>,
     targetables: DirectionalTargetables<'w, 's>,
-    walls: PlayerWallQuery<'w, 's>,
+    wall_index: Res<'w, WallSpatialIndex>,
 }
 
 pub(super) fn update_controller_move_state(
@@ -108,7 +111,7 @@ pub(super) fn update_controller_move_state(
 
 pub(super) fn handle_left_click(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    ctx: ClickContext<'_, '_>,
+    ctx: ClickContext<'_>,
     mut player: Single<&mut MoveTarget, With<Player>>,
     mut target_state: ResMut<TargetState>,
 ) {
@@ -154,12 +157,12 @@ pub(super) fn handle_left_click(
 
     let point = ray.get_point(distance);
     let player_ground = Vec2::new(ctx.player_tf.translation.x, ctx.player_tf.translation.z);
-    let swept = sweep_ground_target(
+    let swept = sweep_ground_target_indexed(
         &ctx.bounds,
         player_ground,
         Vec2::new(point.x, point.z),
         PLAYER_COLLISION_RADIUS,
-        ctx.walls.iter(),
+        &ctx.wall_index,
         PLAYER_WALL_CLEARANCE,
     );
     player.position = Some(swept);
@@ -201,7 +204,7 @@ pub(super) fn handle_controller_targeting(
                 right_input,
                 excluded,
                 &ctx.targetables,
-                &ctx.walls,
+                &ctx.wall_index,
             )
             .or_else(|| {
                 find_directional_target(
@@ -209,7 +212,7 @@ pub(super) fn handle_controller_targeting(
                     right_input,
                     None,
                     &ctx.targetables,
-                    &ctx.walls,
+                    &ctx.wall_index,
                 )
             }) {
                 ctx.target_state.targeted = Some(target);
@@ -239,7 +242,7 @@ pub(super) fn handle_controller_targeting(
                         && target_visible_from_player(
                             player.translation,
                             transform.translation(),
-                            &ctx.walls,
+                            &ctx.wall_index,
                         )
                 },
             );
@@ -250,7 +253,7 @@ pub(super) fn handle_controller_targeting(
                 direction,
                 None,
                 &ctx.targetables,
-                &ctx.walls,
+                &ctx.wall_index,
             );
         }
     }
@@ -259,23 +262,36 @@ pub(super) fn handle_controller_targeting(
 pub(super) fn chase_and_attack_target(
     controls: AttackControls<'_, '_>,
     target_transforms: Query<(&GlobalTransform, &Visibility), With<Targetable>>,
-    walls: PlayerWallQuery<'_, '_>,
     mut player: AttackPlayer<'_>,
     mut attack_intent: Local<AttackIntent>,
+    mut stamina_flash: EventWriter<StaminaFlashEvent>,
 ) {
-    let (attack_pressed, attack_held) = resolve_attack_input(
-        controls.target_state.targeted.is_some(),
-        controls.mouse_buttons.just_pressed(MouseButton::Left),
-        controls.mouse_buttons.pressed(MouseButton::Left),
-        any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger),
-        any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger),
-    );
+    let has_target_lock = controls.target_state.targeted.is_some();
 
-    if attack_pressed {
+    // Light attack: left-click (with target) or RB
+    let light_pressed = (has_target_lock && controls.mouse_buttons.just_pressed(MouseButton::Left))
+        || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger);
+    let light_held = (has_target_lock && controls.mouse_buttons.pressed(MouseButton::Left))
+        || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger);
+
+    // Heavy attack: right-click (with target) or RT
+    let heavy_pressed =
+        (has_target_lock && controls.mouse_buttons.just_pressed(MouseButton::Right))
+            || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger2);
+    let heavy_held = (has_target_lock && controls.mouse_buttons.pressed(MouseButton::Right))
+        || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger2);
+
+    // Heavy takes priority if both pressed simultaneously
+    if heavy_pressed {
         attack_intent.pending_strike = true;
         attack_intent.holding = true;
+        attack_intent.kind = AttackKind::Heavy;
+    } else if light_pressed {
+        attack_intent.pending_strike = true;
+        attack_intent.holding = true;
+        attack_intent.kind = AttackKind::Light;
     }
-    if !attack_held {
+    if !(light_held || heavy_held) {
         attack_intent.holding = false;
     }
 
@@ -306,11 +322,11 @@ pub(super) fn chase_and_attack_target(
                     target_pos.z - player_tf.translation.z,
                 );
                 let distance = to_target.length();
-                let clear_path = segment_clear_of_walls(
+                let clear_path = segment_clear_with_index(
                     Vec2::new(player_tf.translation.x, player_tf.translation.z),
                     Vec2::new(target_pos.x, target_pos.z),
                     PLAYER_COLLISION_RADIUS,
-                    walls.iter(),
+                    &controls.wall_index,
                 );
 
                 if distance > 0.001 {
@@ -352,14 +368,20 @@ pub(super) fn chase_and_attack_target(
     };
 
     let can_attack = attack_intent.pending_strike || attack_intent.holding;
+    let kind = attack_intent.kind;
 
-    if advance_attack_windup(
+    let windup_ready = advance_attack_windup(
         &mut attack_intent,
         can_attack && has_target,
         animator.swing_timer.finished(),
         controls.time.delta_secs(),
-    ) && stats.spend_stamina(ATTACK_STAMINA_COST)
-    {
+        kind.windup(),
+    );
+    let spent = windup_ready && stats.spend_stamina(kind.stamina_cost());
+    if windup_ready && !spent {
+        stamina_flash.send(StaminaFlashEvent);
+    }
+    if spent {
         // Gap-close lunge toward target when swing fires
         if let Some(target_pos) = lunge_target {
             move_target.position = None;
@@ -375,16 +397,18 @@ pub(super) fn chase_and_attack_target(
             }
         }
 
-        animator.swing_timer.reset();
+        animator.swing_timer =
+            Timer::from_seconds(kind.swing_duration(), TimerMode::Once);
         combat.swing_id = combat.swing_id.wrapping_add(1);
         combat.strike = 0.0;
+        combat.attack_kind = kind;
     }
 }
 
 pub(super) fn update_attack_lunge(
     time: Res<Time>,
     bounds: Res<FloorBounds>,
-    walls: PlayerWallQuery<'_, '_>,
+    wall_index: Res<WallSpatialIndex>,
     mut player: Single<(&mut Transform, &mut AttackLunge), With<Player>>,
 ) {
     let (ref mut player_tf, ref mut lunge) = *player;
@@ -406,12 +430,12 @@ pub(super) fn update_attack_lunge(
 
     let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
     let desired = current + step;
-    let swept = sweep_ground_target(
+    let swept = sweep_ground_target_indexed(
         &bounds,
         current,
         desired,
         PLAYER_COLLISION_RADIUS,
-        walls.iter(),
+        &wall_index,
         PLAYER_WALL_CLEARANCE,
     );
     player_tf.translation.x = swept.x;
@@ -423,6 +447,7 @@ pub(super) fn trigger_dodge(
     gamepads: Query<&Gamepad>,
     mut player: DodgePlayer<'_>,
     mut target_state: ResMut<TargetState>,
+    mut stamina_flash: EventWriter<StaminaFlashEvent>,
 ) {
     let (
         player_tf,
@@ -442,6 +467,7 @@ pub(super) fn trigger_dodge(
     }
 
     if !stats.spend_stamina(DODGE_STAMINA_COST) {
+        stamina_flash.send(StaminaFlashEvent);
         return;
     }
 
@@ -461,7 +487,7 @@ pub(super) fn trigger_dodge(
 pub(super) fn update_dodge(
     time: Res<Time>,
     bounds: Res<FloorBounds>,
-    walls: PlayerWallQuery<'_, '_>,
+    wall_index: Res<WallSpatialIndex>,
     mut player: Single<(&mut Transform, &mut Dodge), With<Player>>,
 ) {
     let (ref mut player_tf, ref mut dodge) = *player;
@@ -480,12 +506,12 @@ pub(super) fn update_dodge(
         * (dodge_motion_curve(progress) - dodge_motion_curve(previous_progress)).max(0.0);
     let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
     let desired_end = current + Vec2::new(dodge.direction.x, dodge.direction.z) * step;
-    let swept = sweep_ground_target(
+    let swept = sweep_ground_target_indexed(
         &bounds,
         current,
         desired_end,
         PLAYER_COLLISION_RADIUS,
-        walls.iter(),
+        &wall_index,
         PLAYER_WALL_CLEARANCE,
     );
     player_tf.translation.x = swept.x;
@@ -525,6 +551,83 @@ fn dodge_direction(
     }
 }
 
+pub(super) fn use_healing_flask(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut player: Single<(&mut HealingFlask, &mut HitPoints), With<Player>>,
+) {
+    let (ref mut flask, ref mut hp) = *player;
+    flask.cooldown.tick(time.delta());
+
+    let pressed = keyboard.just_pressed(KeyCode::KeyQ)
+        || any_gamepad_just_pressed(&gamepads, GamepadButton::North);
+
+    if !pressed || !flask.cooldown.finished() || flask.charges <= 0 || hp.current >= hp.max {
+        return;
+    }
+
+    flask.charges -= 1;
+    flask.cooldown.reset();
+
+    let heal = flask.heal_amount.min(hp.max - hp.current);
+    hp.current += heal;
+}
+
+pub(super) fn rest_at_bonfire(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut player: Single<
+        (
+            &Transform,
+            &mut HitPoints,
+            &mut PlayerStats,
+            &mut HealingFlask,
+        ),
+        With<Player>,
+    >,
+    mut bonfires: Query<(&Transform, &mut Bonfire), Without<Player>>,
+    mut last_bonfire: ResMut<crate::hud::LastBonfirePosition>,
+    mut respawn: EventWriter<RespawnEnemies>,
+) {
+    let pressed = keyboard.just_pressed(KeyCode::KeyE)
+        || any_gamepad_just_pressed(&gamepads, GamepadButton::West);
+
+    if !pressed {
+        return;
+    }
+
+    let (player_tf, ref mut hp, ref mut stats, ref mut flask) = *player;
+    let player_ground = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+
+    let mut found = None;
+    for (bonfire_tf, bonfire) in &mut bonfires {
+        let bonfire_ground = Vec2::new(bonfire_tf.translation.x, bonfire_tf.translation.z);
+        if player_ground.distance(bonfire_ground) <= crate::world::BONFIRE_INTERACT_RADIUS {
+            found = Some((bonfire_tf.translation, bonfire));
+            break;
+        }
+    }
+
+    let Some((bonfire_pos, mut bonfire)) = found else {
+        return;
+    };
+
+    // Always track this as the last bonfire visited
+    last_bonfire.0 = bonfire_pos;
+
+    if !bonfire.lit {
+        bonfire.lit = true;
+        return;
+    }
+
+    // Rest: refill everything, respawn enemies
+    hp.heal_to_full();
+    stats.stamina = stats.max_stamina;
+    **flask = HealingFlask::default();
+    respawn.send(RespawnEnemies);
+}
+
 pub(super) fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats, With<Player>>) {
     player.regen_delay.tick(time.delta());
     if player.regen_delay.finished() && player.stamina < player.max_stamina {
@@ -540,7 +643,7 @@ pub(super) fn move_player_with_controller(
     >,
     time: Res<Time>,
     bounds: Res<FloorBounds>,
-    walls: PlayerWallQuery<'_, '_>,
+    wall_index: Res<WallSpatialIndex>,
 ) {
     let (ref mut player_tf, ref mut move_target, controller_move, dodge) = *player_query;
 
@@ -564,12 +667,12 @@ pub(super) fn move_player_with_controller(
     let step = MOVE_SPEED * magnitude * time.delta_secs();
     let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
     let desired_end = current + direction * step;
-    let swept = sweep_ground_target(
+    let swept = sweep_ground_target_indexed(
         &bounds,
         current,
         desired_end,
         PLAYER_COLLISION_RADIUS,
-        walls.iter(),
+        &wall_index,
         PLAYER_WALL_CLEARANCE,
     );
     player_tf.translation.x = swept.x;
@@ -580,7 +683,7 @@ pub(super) fn move_player(
     mut player_query: Single<(&mut Transform, &mut MoveTarget, &Dodge), With<Player>>,
     time: Res<Time>,
     bounds: Res<FloorBounds>,
-    walls: PlayerWallQuery<'_, '_>,
+    wall_index: Res<WallSpatialIndex>,
 ) {
     let (ref mut player_tf, ref mut move_target, dodge) = *player_query;
 
@@ -614,12 +717,12 @@ pub(super) fn move_player(
     } else {
         current + direction * step_mag
     };
-    let swept = sweep_ground_target(
+    let swept = sweep_ground_target_indexed(
         &bounds,
         current,
         desired_end,
         PLAYER_COLLISION_RADIUS,
-        walls.iter(),
+        &wall_index,
         PLAYER_WALL_CLEARANCE,
     );
     player_tf.translation.x = swept.x;
@@ -638,30 +741,16 @@ fn any_gamepad_pressed(gamepads: &Query<&Gamepad>, button: GamepadButton) -> boo
     gamepads.iter().any(|gamepad| gamepad.pressed(button))
 }
 
-fn resolve_attack_input(
-    mouse_target_locked: bool,
-    mouse_pressed: bool,
-    mouse_held: bool,
-    gamepad_pressed: bool,
-    gamepad_held: bool,
-) -> (bool, bool) {
-    let mouse_attack_pressed = mouse_target_locked && mouse_pressed;
-    let mouse_attack_held = mouse_target_locked && mouse_held;
-    (
-        mouse_attack_pressed || gamepad_pressed,
-        mouse_attack_held || gamepad_held,
-    )
-}
-
 fn advance_attack_windup(
     attack_intent: &mut AttackIntent,
     can_attack: bool,
     swing_ready: bool,
     delta_secs: f32,
+    windup_threshold: f32,
 ) -> bool {
     if can_attack && swing_ready {
         attack_intent.windup += delta_secs;
-        if attack_intent.windup >= ATTACK_WINDUP {
+        if attack_intent.windup >= windup_threshold {
             attack_intent.pending_strike = false;
             attack_intent.windup = 0.0;
             return true;
@@ -722,7 +811,7 @@ fn find_directional_target(
     direction: Vec2,
     excluded: Option<Entity>,
     targetables: &DirectionalTargetables<'_, '_>,
-    walls: &PlayerWallQuery<'_, '_>,
+    wall_index: &WallSpatialIndex,
 ) -> Option<Entity> {
     let direction_len_sq = direction.length_squared();
     if direction_len_sq <= 0.0001 {
@@ -750,7 +839,7 @@ fn find_directional_target(
         if distance_sq <= 0.0001 || distance_sq > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE {
             continue;
         }
-        if !target_visible_from_player(player_translation, transform.translation(), walls) {
+        if !target_visible_from_player(player_translation, transform.translation(), wall_index) {
             continue;
         }
 
@@ -771,13 +860,13 @@ fn find_directional_target(
 fn target_visible_from_player(
     player_translation: Vec3,
     target_translation: Vec3,
-    walls: &PlayerWallQuery<'_, '_>,
+    wall_index: &WallSpatialIndex,
 ) -> bool {
-    segment_clear_of_walls(
+    segment_clear_with_index(
         Vec2::new(player_translation.x, player_translation.z),
         Vec2::new(target_translation.x, target_translation.z),
         0.0,
-        walls.iter(),
+        wall_index,
     )
 }
 
@@ -808,33 +897,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ground_click_does_not_arm_mouse_attack_without_target() {
-        assert_eq!(
-            resolve_attack_input(false, true, true, false, false),
-            (false, false)
-        );
-    }
-
-    #[test]
-    fn targeted_click_arms_mouse_attack() {
-        assert_eq!(
-            resolve_attack_input(true, true, true, false, false),
-            (true, true)
-        );
-    }
-
-    #[test]
-    fn failed_single_click_is_consumed_after_windup() {
+    fn light_windup_fires_after_threshold() {
+        let windup = AttackKind::Light.windup();
         let mut intent = AttackIntent {
             pending_strike: true,
             holding: false,
-            windup: ATTACK_WINDUP - 0.01,
+            windup: windup - 0.01,
+            kind: AttackKind::Light,
         };
 
-        assert!(advance_attack_windup(&mut intent, true, true, 0.02));
+        assert!(advance_attack_windup(&mut intent, true, true, 0.02, windup));
         assert!(!intent.pending_strike);
-        assert!(!intent.holding);
         assert_eq!(intent.windup, 0.0);
-        assert!(!advance_attack_windup(&mut intent, false, true, 0.02));
+    }
+
+    #[test]
+    fn heavy_windup_does_not_fire_early() {
+        let windup = AttackKind::Heavy.windup();
+        let mut intent = AttackIntent {
+            pending_strike: true,
+            holding: true,
+            windup: 0.0,
+            kind: AttackKind::Heavy,
+        };
+
+        // Advance less than the heavy windup threshold
+        assert!(!advance_attack_windup(
+            &mut intent,
+            true,
+            true,
+            windup - 0.01,
+            windup
+        ));
+        assert!(intent.pending_strike);
+    }
+
+    #[test]
+    fn windup_resets_when_attack_cancelled() {
+        let mut intent = AttackIntent {
+            pending_strike: false,
+            holding: false,
+            windup: 0.10,
+            kind: AttackKind::Light,
+        };
+
+        assert!(!advance_attack_windup(
+            &mut intent,
+            false,
+            true,
+            0.02,
+            AttackKind::Light.windup()
+        ));
+        assert_eq!(intent.windup, 0.0);
     }
 }

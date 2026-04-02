@@ -7,9 +7,7 @@ use crate::combat::{smoothstep01, DamageRng, FlashTint, HitFlash, HitPoints, Stu
 use crate::player::{Dodge, Player, PlayerCombat};
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::fog::FogDynamic;
-use crate::world::tilemap::{
-    sweep_ground_target, FloorBounds, Wall, WallCollider, WallSpatialIndex,
-};
+use crate::world::tilemap::{sweep_ground_target_indexed, FloorBounds, WallSpatialIndex};
 
 use super::{
     build_player_slash_state, try_player_slash, Dying, EnemyCollision, SlashTarget,
@@ -80,15 +78,11 @@ type RatActors<'w, 's> = Query<
     (Without<Player>, Without<Dying>),
 >;
 
-type RatWallQuery<'w, 's> =
-    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<DemonRat>)>;
-
 #[derive(SystemParam)]
 pub(super) struct RatUpdateContext<'w, 's> {
     commands: Commands<'w, 's>,
     bounds: Res<'w, FloorBounds>,
     wall_index: Res<'w, WallSpatialIndex>,
-    walls: RatWallQuery<'w, 's>,
     damage_rng: ResMut<'w, DamageRng>,
     target_state: ResMut<'w, TargetState>,
 }
@@ -100,7 +94,7 @@ const RAT_ATTACK_COOLDOWN: f32 = 0.9;
 const RAT_LUNGE_SPEED: f32 = 4.35;
 const RAT_ATTACK_DURATION: f32 = 0.48;
 const RAT_HOP_HEIGHT: f32 = 0.42;
-const RAT_BITE_DAMAGE: i32 = 1;
+const RAT_BITE_DAMAGE: i32 = 3;
 const RAT_BITE_HIT_PROGRESS: f32 = 0.58;
 const RAT_BITE_REACH: f32 = 1.48;
 const RAT_HP: i32 = 8;
@@ -498,12 +492,12 @@ pub(super) fn update_demon_rats(
             let travel = step.min(remaining);
             let current = Vec2::new(transform.translation.x, transform.translation.z);
             let desired_end = current + Vec2::new(move_direction.x, move_direction.z) * travel;
-            let swept = sweep_ground_target(
+            let swept = sweep_ground_target_indexed(
                 &ctx.bounds,
                 current,
                 desired_end,
                 RAT_COLLISION_RADIUS,
-                ctx.walls.iter(),
+                &ctx.wall_index,
                 RAT_WALL_CLEARANCE,
             );
             let moved_distance = swept.distance(current);
@@ -532,12 +526,12 @@ pub(super) fn update_demon_rats(
             transform.translation.y = hop * RAT_HOP_HEIGHT;
             let current = Vec2::new(transform.translation.x, transform.translation.z);
             let desired_end = current + Vec2::new(forward.x, forward.z) * lunge;
-            let swept = sweep_ground_target(
+            let swept = sweep_ground_target_indexed(
                 &ctx.bounds,
                 current,
                 desired_end,
                 RAT_COLLISION_RADIUS,
-                ctx.walls.iter(),
+                &ctx.wall_index,
                 RAT_WALL_CLEARANCE,
             );
             transform.translation.x = swept.x;

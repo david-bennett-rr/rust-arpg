@@ -7,9 +7,7 @@ use crate::combat::{smoothstep01, DamageRng, FlashTint, HitFlash, HitPoints, Stu
 use crate::player::{Player, PlayerCombat};
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::fog::FogDynamic;
-use crate::world::tilemap::{
-    sweep_ground_target, FloorBounds, Wall, WallCollider, WallSpatialIndex,
-};
+use crate::world::tilemap::{sweep_ground_target_indexed, FloorBounds, WallSpatialIndex};
 
 use super::arrow::{spawn_arrow, ArrowMeshes};
 use super::{
@@ -74,9 +72,6 @@ type GoblinActors<'w, 's> = Query<
     (Without<Player>, Without<Dying>),
 >;
 
-type GoblinWallQuery<'w, 's> =
-    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<GoblinArcher>)>;
-
 #[derive(SystemParam)]
 pub(super) struct GoblinUpdateContext<'w, 's> {
     commands: Commands<'w, 's>,
@@ -102,7 +97,7 @@ fn choose_flee_direction(
     player: Vec2,
     travel: f32,
     bounds: &FloorBounds,
-    walls: &[(&Transform, &WallCollider)],
+    wall_index: &WallSpatialIndex,
 ) -> Vec3 {
     let away = (current - player).normalize_or_zero();
     if away == Vec2::ZERO {
@@ -126,12 +121,12 @@ fn choose_flee_direction(
             continue;
         }
 
-        let swept = sweep_ground_target(
+        let swept = sweep_ground_target_indexed(
             bounds,
             current,
             current + candidate * travel,
             GOBLIN_COLLISION_RADIUS,
-            walls.iter().copied(),
+            wall_index,
             GOBLIN_WALL_CLEARANCE,
         );
         let moved_distance = swept.distance(current);
@@ -591,7 +586,6 @@ pub(super) fn do_spawn_goblins(
 pub(super) fn update_goblin_archers(
     time: Res<Time>,
     bounds: Res<FloorBounds>,
-    walls: GoblinWallQuery<'_, '_>,
     mut ctx: GoblinUpdateContext<'_, '_>,
     mut goblins: GoblinActors<'_, '_>,
 ) {
@@ -599,7 +593,6 @@ pub(super) fn update_goblin_archers(
     let (player_transform, player_combat) = *ctx.player;
     let player_slash = build_player_slash_state(player_transform, player_combat);
     let player_ground = player_slash.ground;
-    let wall_segments: Vec<_> = walls.iter().collect();
 
     for (
         entity,
@@ -717,7 +710,7 @@ pub(super) fn update_goblin_archers(
                         Vec2::new(player_ground.x, player_ground.z),
                         travel,
                         &bounds,
-                        &wall_segments,
+                        &ctx.wall_index,
                     );
                 }
 
@@ -727,12 +720,12 @@ pub(super) fn update_goblin_archers(
                 }
 
                 let desired_end = current + Vec2::new(move_direction.x, move_direction.z) * travel;
-                let swept = sweep_ground_target(
+                let swept = sweep_ground_target_indexed(
                     &bounds,
                     current,
                     desired_end,
                     GOBLIN_COLLISION_RADIUS,
-                    wall_segments.iter().copied(),
+                    &ctx.wall_index,
                     GOBLIN_WALL_CLEARANCE,
                 );
                 let moved_distance = swept.distance(current);
@@ -877,11 +870,14 @@ pub(super) fn animate_goblin_archers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::tilemap::{WallSegment, WallSpatialIndex};
 
     #[test]
     fn flee_direction_prefers_straight_escape_when_clear() {
         let bounds = FloorBounds::default();
-        let direction = choose_flee_direction(Vec2::ZERO, Vec2::new(2.0, 0.0), 1.0, &bounds, &[]);
+        let wall_index = WallSpatialIndex::default();
+        let direction =
+            choose_flee_direction(Vec2::ZERO, Vec2::new(2.0, 0.0), 1.0, &bounds, &wall_index);
 
         assert!(direction.x < -0.9);
         assert!(direction.z.abs() < 0.01);
@@ -890,18 +886,13 @@ mod tests {
     #[test]
     fn flee_direction_uses_side_step_when_backpedal_is_blocked() {
         let bounds = FloorBounds::default();
-        let wall_tf = Transform::from_xyz(-1.8, 0.0, 0.0);
-        let wall = WallCollider {
-            half_x: 0.15,
-            half_z: 0.05,
-        };
-        let direction = choose_flee_direction(
-            Vec2::ZERO,
-            Vec2::new(2.0, 0.0),
-            1.0,
-            &bounds,
-            &[(&wall_tf, &wall)],
-        );
+        let mut wall_index = WallSpatialIndex::default();
+        wall_index.rebuild(vec![WallSegment {
+            center: Vec2::new(-1.8, 0.0),
+            half_extents: Vec2::new(0.15, 0.05),
+        }]);
+        let direction =
+            choose_flee_direction(Vec2::ZERO, Vec2::new(2.0, 0.0), 1.0, &bounds, &wall_index);
 
         assert!(direction.length_squared() > 0.0);
         assert!(direction.z.abs() > 0.05);

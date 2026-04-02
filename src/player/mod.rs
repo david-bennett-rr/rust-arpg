@@ -27,6 +27,8 @@ impl Plugin for PlayerPlugin {
                     systems::update_attack_lunge,
                     systems::trigger_dodge,
                     systems::update_dodge,
+                    systems::use_healing_flask,
+                    systems::rest_at_bonfire,
                     systems::regen_stamina,
                     systems::move_player_with_controller,
                     systems::move_player,
@@ -59,10 +61,41 @@ impl ControllerMove {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum AttackKind {
+    #[default]
+    Light,
+    Heavy,
+}
+
+impl AttackKind {
+    pub fn windup(self) -> f32 {
+        match self {
+            Self::Light => LIGHT_WINDUP,
+            Self::Heavy => HEAVY_WINDUP,
+        }
+    }
+
+    pub fn swing_duration(self) -> f32 {
+        match self {
+            Self::Light => LIGHT_SWING_DURATION,
+            Self::Heavy => HEAVY_SWING_DURATION,
+        }
+    }
+
+    pub fn stamina_cost(self) -> f32 {
+        match self {
+            Self::Light => LIGHT_STAMINA_COST,
+            Self::Heavy => HEAVY_STAMINA_COST,
+        }
+    }
+}
+
 #[derive(Component, Default)]
 pub struct PlayerCombat {
     pub swing_id: u32,
     pub strike: f32,
+    pub attack_kind: AttackKind,
 }
 
 #[derive(Component)]
@@ -149,6 +182,29 @@ impl AttackLunge {
     }
 }
 
+const FLASK_CHARGES: i32 = 3;
+const FLASK_HEAL: i32 = 20;
+const FLASK_COOLDOWN: f32 = 0.8;
+
+#[derive(Component)]
+pub struct HealingFlask {
+    pub charges: i32,
+    pub heal_amount: i32,
+    cooldown: Timer,
+}
+
+impl Default for HealingFlask {
+    fn default() -> Self {
+        let mut cooldown = Timer::from_seconds(FLASK_COOLDOWN, TimerMode::Once);
+        cooldown.tick(std::time::Duration::from_secs_f32(FLASK_COOLDOWN));
+        Self {
+            charges: FLASK_CHARGES,
+            heal_amount: FLASK_HEAL,
+            cooldown,
+        }
+    }
+}
+
 const DEATH_ANIM_DURATION: f32 = 1.2;
 
 #[derive(Component)]
@@ -222,15 +278,23 @@ const ATTACK_RANGE: f32 = 2.3;
 const ATTACK_LUNGE_RANGE: f32 = 3.5;
 const ATTACK_LUNGE_STOP: f32 = 1.6;
 const ATTACK_LUNGE_DURATION: f32 = 0.12;
-const ATTACK_WINDUP: f32 = 0.14;
 const DODGE_DURATION: f32 = 0.38;
 const DODGE_COOLDOWN: f32 = 0.8;
 const DODGE_DISTANCE: f32 = 6.4;
 
+// Light attack (RB / left-click)
+const LIGHT_WINDUP: f32 = 0.08;
+const LIGHT_SWING_DURATION: f32 = 0.40;
+const LIGHT_STAMINA_COST: f32 = 15.0;
+
+// Heavy attack (RT / right-click)
+const HEAVY_WINDUP: f32 = 0.24;
+const HEAVY_SWING_DURATION: f32 = 0.70;
+const HEAVY_STAMINA_COST: f32 = 30.0;
+
 const MAX_STAMINA: f32 = 60.0;
 const STAMINA_REGEN: f32 = 18.0;
 const STAMINA_REGEN_DELAY: f32 = 0.6;
-const ATTACK_STAMINA_COST: f32 = 22.0;
 const DODGE_STAMINA_COST: f32 = 12.0;
 
 pub fn visual_forward(transform: &Transform) -> Vec3 {

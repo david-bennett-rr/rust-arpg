@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bevy::prelude::*;
 
@@ -137,12 +137,12 @@ impl WallSpatialIndex {
     pub fn rebuild(&mut self, segments: Vec<WallSegment>) {
         self.cells.clear();
         self.segments = segments;
+        self.cells.reserve(self.segments.len());
 
         for (index, segment) in self.segments.iter().enumerate() {
             let min = segment.center - segment.half_extents;
             let max = segment.center + segment.half_extents;
-            let min_cell = self.cell_coords(min);
-            let max_cell = self.cell_coords(max);
+            let (min_cell, max_cell) = self.cell_range(min, max);
 
             for x in min_cell.x..=max_cell.x {
                 for z in min_cell.y..=max_cell.y {
@@ -157,40 +157,10 @@ impl WallSpatialIndex {
     }
 
     pub fn first_hit_fraction(&self, start: Vec2, end: Vec2, radius: f32) -> Option<f32> {
-        let mut seen = HashSet::new();
-        let mut best_hit: Option<f32> = None;
-
-        for segment in self.potential_segments(start, end, radius, &mut seen) {
-            let Some(hit_fraction) = segment_aabb_intersection_fraction(
-                start,
-                end,
-                segment.center,
-                segment.half_extents + Vec2::splat(radius),
-            ) else {
-                continue;
-            };
-
-            best_hit = Some(match best_hit {
-                Some(best) => best.min(hit_fraction),
-                None => hit_fraction,
-            });
-        }
-
-        best_hit
-    }
-
-    fn potential_segments<'a>(
-        &'a self,
-        start: Vec2,
-        end: Vec2,
-        radius: f32,
-        seen: &mut HashSet<usize>,
-    ) -> Vec<&'a WallSegment> {
         let min = start.min(end) - Vec2::splat(radius);
         let max = start.max(end) + Vec2::splat(radius);
-        let min_cell = self.cell_coords(min);
-        let max_cell = self.cell_coords(max);
-        let mut segments = Vec::new();
+        let (min_cell, max_cell) = self.cell_range(min, max);
+        let mut best_hit: Option<f32> = None;
 
         for x in min_cell.x..=max_cell.x {
             for z in min_cell.y..=max_cell.y {
@@ -199,14 +169,51 @@ impl WallSpatialIndex {
                 };
 
                 for &index in indices {
-                    if seen.insert(index) {
-                        segments.push(&self.segments[index]);
-                    }
+                    let segment = &self.segments[index];
+                    let Some(hit_fraction) = segment_aabb_intersection_fraction(
+                        start,
+                        end,
+                        segment.center,
+                        segment.half_extents + Vec2::splat(radius),
+                    ) else {
+                        continue;
+                    };
+
+                    best_hit = Some(match best_hit {
+                        Some(best) => best.min(hit_fraction),
+                        None => hit_fraction,
+                    });
                 }
             }
         }
 
-        segments
+        best_hit
+    }
+
+    pub fn for_each_nearby_segment(
+        &self,
+        point: Vec2,
+        radius: f32,
+        mut visit: impl FnMut(&WallSegment),
+    ) {
+        let min = point - Vec2::splat(radius);
+        let max = point + Vec2::splat(radius);
+        let (min_cell, max_cell) = self.cell_range(min, max);
+        for x in min_cell.x..=max_cell.x {
+            for z in min_cell.y..=max_cell.y {
+                let Some(indices) = self.cells.get(&IVec2::new(x, z)) else {
+                    continue;
+                };
+
+                for &index in indices {
+                    visit(&self.segments[index]);
+                }
+            }
+        }
+    }
+
+    fn cell_range(&self, min: Vec2, max: Vec2) -> (IVec2, IVec2) {
+        (self.cell_coords(min), self.cell_coords(max))
     }
 
     fn cell_coords(&self, point: Vec2) -> IVec2 {
@@ -281,6 +288,7 @@ pub fn clamp_translation(bounds: &FloorBounds, translation: &mut Vec3, radius: f
     translation.z = translation.z.clamp(cz - hz, cz + hz);
 }
 
+#[allow(dead_code)]
 pub fn sweep_ground_target<'a, I>(
     bounds: &FloorBounds,
     start: Vec2,
@@ -296,6 +304,19 @@ where
     clip_segment_to_walls(start, clamped_end, radius, walls, clearance)
 }
 
+pub fn sweep_ground_target_indexed(
+    bounds: &FloorBounds,
+    start: Vec2,
+    desired_end: Vec2,
+    radius: f32,
+    wall_index: &WallSpatialIndex,
+    clearance: f32,
+) -> Vec2 {
+    let clamped_end = clamp_ground_target(bounds, desired_end, radius);
+    clip_segment_to_wall_index(start, clamped_end, radius, wall_index, clearance)
+}
+
+#[allow(dead_code)]
 pub fn clip_segment_to_walls<'a, I>(
     start: Vec2,
     end: Vec2,
@@ -320,6 +341,28 @@ where
     start + delta * (hit_fraction - backoff).max(0.0)
 }
 
+pub fn clip_segment_to_wall_index(
+    start: Vec2,
+    end: Vec2,
+    radius: f32,
+    wall_index: &WallSpatialIndex,
+    clearance: f32,
+) -> Vec2 {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= 0.0001 {
+        return end;
+    }
+
+    let Some(hit_fraction) = wall_index.first_hit_fraction(start, end, radius) else {
+        return end;
+    };
+
+    let backoff = (clearance / length).clamp(0.0, hit_fraction);
+    start + delta * (hit_fraction - backoff).max(0.0)
+}
+
+#[allow(dead_code)]
 pub fn segment_clear_of_walls<'a, I>(start: Vec2, end: Vec2, radius: f32, walls: I) -> bool
 where
     I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
@@ -327,6 +370,16 @@ where
     first_wall_hit_fraction(start, end, radius, walls).is_none()
 }
 
+pub fn segment_clear_with_index(
+    start: Vec2,
+    end: Vec2,
+    radius: f32,
+    wall_index: &WallSpatialIndex,
+) -> bool {
+    wall_index.segment_clear(start, end, radius)
+}
+
+#[allow(dead_code)]
 pub fn first_wall_hit_fraction<'a, I>(start: Vec2, end: Vec2, radius: f32, walls: I) -> Option<f32>
 where
     I: IntoIterator<Item = (&'a Transform, &'a WallCollider)>,
@@ -485,6 +538,7 @@ const WALL_THICKNESS: f32 = 0.3;
 pub struct Wall;
 
 /// Axis-aligned collision box for a wall segment (XZ plane).
+#[allow(dead_code)]
 #[derive(Component)]
 pub struct WallCollider {
     pub half_x: f32,
@@ -499,13 +553,6 @@ type WallCollisionEnemies<'w, 's> = Query<
     's,
     (&'static mut Transform, &'static EnemyCollision),
     (Without<Player>, Without<Wall>),
->;
-
-type WallCollisionWalls<'w, 's> = Query<
-    'w,
-    's,
-    (&'static Transform, &'static WallCollider),
-    (With<Wall>, Without<Player>, Without<EnemyCollision>),
 >;
 
 /// Spawn walls around the perimeter of a room, with gaps only at doors that
@@ -754,47 +801,71 @@ pub fn spawn_corridor_floor(
 
 /// Push characters out of wall AABBs after all movement has finished.
 pub fn resolve_wall_collisions(
-    walls: WallCollisionWalls<'_, '_>,
+    bounds: Res<FloorBounds>,
+    wall_index: Res<WallSpatialIndex>,
     mut players: WallCollisionPlayers<'_, '_>,
     mut enemies: WallCollisionEnemies<'_, '_>,
 ) {
     for mut player_tf in &mut players {
-        for (wall_tf, wall_col) in &walls {
-            push_out_of_wall(
-                &mut player_tf.translation,
-                PLAYER_COLLISION_RADIUS,
-                wall_tf.translation,
-                wall_col,
-            );
-        }
+        push_out_of_nearby_walls(
+            &mut player_tf.translation,
+            PLAYER_COLLISION_RADIUS,
+            &wall_index,
+        );
+        clamp_translation(&bounds, &mut player_tf.translation, PLAYER_COLLISION_RADIUS);
     }
     for (mut enemy_tf, enemy_col) in &mut enemies {
-        for (wall_tf, wall_col) in &walls {
-            push_out_of_wall(
-                &mut enemy_tf.translation,
-                enemy_col.radius,
-                wall_tf.translation,
-                wall_col,
-            );
+        push_out_of_nearby_walls(&mut enemy_tf.translation, enemy_col.radius, &wall_index);
+        clamp_translation(&bounds, &mut enemy_tf.translation, enemy_col.radius);
+    }
+}
+
+#[allow(dead_code)]
+fn push_out_of_wall(translation: &mut Vec3, radius: f32, wall_pos: Vec3, wall: &WallCollider) {
+    push_out_of_wall_segment(
+        translation,
+        radius,
+        Vec2::new(wall_pos.x, wall_pos.z),
+        Vec2::new(wall.half_x, wall.half_z),
+    );
+}
+
+fn push_out_of_nearby_walls(translation: &mut Vec3, radius: f32, wall_index: &WallSpatialIndex) {
+    for _ in 0..3 {
+        let before = *translation;
+        let center = Vec2::new(translation.x, translation.z);
+        wall_index.for_each_nearby_segment(center, radius, |segment| {
+            push_out_of_wall_segment(translation, radius, segment.center, segment.half_extents);
+        });
+
+        if translation.distance_squared(before) <= 0.000_001 {
+            break;
         }
     }
 }
 
-fn push_out_of_wall(translation: &mut Vec3, radius: f32, wall_pos: Vec3, wall: &WallCollider) {
+fn push_out_of_wall_segment(
+    translation: &mut Vec3,
+    radius: f32,
+    wall_center: Vec2,
+    wall_half_extents: Vec2,
+) {
     // Quick reject: skip walls clearly outside the actor's reach
-    if (translation.x - wall_pos.x).abs() > wall.half_x + radius
-        || (translation.z - wall_pos.z).abs() > wall.half_z + radius
+    if (translation.x - wall_center.x).abs() > wall_half_extents.x + radius
+        || (translation.z - wall_center.y).abs() > wall_half_extents.y + radius
     {
         return;
     }
 
     // Closest point on the wall AABB to the character center (XZ plane)
-    let closest_x = translation
-        .x
-        .clamp(wall_pos.x - wall.half_x, wall_pos.x + wall.half_x);
-    let closest_z = translation
-        .z
-        .clamp(wall_pos.z - wall.half_z, wall_pos.z + wall.half_z);
+    let closest_x = translation.x.clamp(
+        wall_center.x - wall_half_extents.x,
+        wall_center.x + wall_half_extents.x,
+    );
+    let closest_z = translation.z.clamp(
+        wall_center.y - wall_half_extents.y,
+        wall_center.y + wall_half_extents.y,
+    );
 
     let dx = translation.x - closest_x;
     let dz = translation.z - closest_z;
@@ -812,19 +883,19 @@ fn push_out_of_wall(translation: &mut Vec3, radius: f32, wall_pos: Vec3, wall: &
         translation.z += (dz / dist) * penetration;
     } else {
         // Center inside the AABB — push out along shortest escape axis
-        let pen_px = (wall_pos.x + wall.half_x + radius) - translation.x;
-        let pen_nx = translation.x - (wall_pos.x - wall.half_x - radius);
-        let pen_pz = (wall_pos.z + wall.half_z + radius) - translation.z;
-        let pen_nz = translation.z - (wall_pos.z - wall.half_z - radius);
+        let pen_px = (wall_center.x + wall_half_extents.x + radius) - translation.x;
+        let pen_nx = translation.x - (wall_center.x - wall_half_extents.x - radius);
+        let pen_pz = (wall_center.y + wall_half_extents.y + radius) - translation.z;
+        let pen_nz = translation.z - (wall_center.y - wall_half_extents.y - radius);
         let min = pen_px.min(pen_nx).min(pen_pz).min(pen_nz);
         if min == pen_px {
-            translation.x = wall_pos.x + wall.half_x + radius;
+            translation.x = wall_center.x + wall_half_extents.x + radius;
         } else if min == pen_nx {
-            translation.x = wall_pos.x - wall.half_x - radius;
+            translation.x = wall_center.x - wall_half_extents.x - radius;
         } else if min == pen_pz {
-            translation.z = wall_pos.z + wall.half_z + radius;
+            translation.z = wall_center.y + wall_half_extents.y + radius;
         } else {
-            translation.z = wall_pos.z - wall.half_z - radius;
+            translation.z = wall_center.y - wall_half_extents.y - radius;
         }
     }
 }
