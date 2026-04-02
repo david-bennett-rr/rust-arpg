@@ -4,12 +4,15 @@ use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::camera::MainCamera;
 use crate::targeting::{TargetState, Targetable};
-use crate::world::tilemap::{clamp_ground_target_to_arena, clamp_translation_to_arena};
+use crate::world::tilemap::{
+    clamp_ground_target, segment_clear_of_walls, sweep_ground_target, FloorBounds, Wall,
+    WallCollider,
+};
 
 use super::{
-    ARRIVE_THRESHOLD, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP, ControllerMove,
-    DODGE_DISTANCE, DODGE_STAMINA_COST, Dodge, KnightAnimator, MOVE_SPEED, MoveTarget,
-    PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerStats, dodge_motion_curve, visual_forward,
+    dodge_motion_curve, visual_forward, ControllerMove, Dodge, KnightAnimator, MoveTarget, Player,
+    PlayerCombat, PlayerStats, ARRIVE_THRESHOLD, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP,
+    DODGE_DISTANCE, DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
 };
 
 type DodgePlayer<'w> = Single<
@@ -31,6 +34,7 @@ type AttackPlayer<'w> = Single<
     (
         &'static mut Transform,
         &'static mut MoveTarget,
+        &'static ControllerMove,
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
         &'static mut PlayerStats,
@@ -38,23 +42,23 @@ type AttackPlayer<'w> = Single<
     With<Player>,
 >;
 
+type PlayerWallQuery<'w, 's> =
+    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<Player>)>;
+
+type DirectionalTargetables<'w, 's> =
+    Query<'w, 's, (Entity, &'static GlobalTransform, &'static Visibility), With<Targetable>>;
+
 const MOVE_DEADZONE: f32 = 0.18;
 const TARGET_SWITCH_DEADZONE: f32 = 0.72;
 const TARGET_DIRECTION_DOT: f32 = 0.2;
+const MAX_TARGET_DISTANCE: f32 = 20.0;
+const PLAYER_WALL_CLEARANCE: f32 = 0.08;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct AttackIntent {
     pending_strike: bool,
     holding: bool,
     windup: f32,
-}
-
-impl AttackIntent {
-    fn clear(&mut self) {
-        self.pending_strike = false;
-        self.holding = false;
-        self.windup = 0.0;
-    }
 }
 
 #[derive(SystemParam)]
@@ -63,6 +67,23 @@ pub(super) struct AttackControls<'w, 's> {
     mouse_buttons: Res<'w, ButtonInput<MouseButton>>,
     gamepads: Query<'w, 's, &'static Gamepad>,
     time: Res<'w, Time>,
+    bounds: Res<'w, FloorBounds>,
+}
+
+#[derive(SystemParam)]
+pub(super) struct ClickContext<'w, 's> {
+    window: Option<Single<'w, &'static Window, With<PrimaryWindow>>>,
+    camera_query: Option<Single<'w, (&'static Camera, &'static GlobalTransform), With<MainCamera>>>,
+    player_tf: Single<'w, &'static Transform, With<Player>>,
+    bounds: Res<'w, FloorBounds>,
+    walls: PlayerWallQuery<'w, 's>,
+}
+
+#[derive(SystemParam)]
+pub(super) struct ControllerTargetingContext<'w, 's> {
+    target_state: ResMut<'w, TargetState>,
+    targetables: DirectionalTargetables<'w, 's>,
+    walls: PlayerWallQuery<'w, 's>,
 }
 
 pub(super) fn update_controller_move_state(
@@ -85,8 +106,7 @@ pub(super) fn update_controller_move_state(
 
 pub(super) fn handle_left_click(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    window: Option<Single<&Window, With<PrimaryWindow>>>,
-    camera_query: Option<Single<(&Camera, &GlobalTransform), With<MainCamera>>>,
+    ctx: ClickContext<'_, '_>,
     mut player: Single<&mut MoveTarget, With<Player>>,
     mut target_state: ResMut<TargetState>,
 ) {
@@ -106,10 +126,10 @@ pub(super) fn handle_left_click(
         return;
     }
 
-    let Some(window) = window else {
+    let Some(window) = ctx.window else {
         return;
     };
-    let Some(camera_query) = camera_query else {
+    let Some(camera_query) = ctx.camera_query else {
         return;
     };
 
@@ -131,10 +151,16 @@ pub(super) fn handle_left_click(
     };
 
     let point = ray.get_point(distance);
-    player.position = Some(clamp_ground_target_to_arena(
+    let player_ground = Vec2::new(ctx.player_tf.translation.x, ctx.player_tf.translation.z);
+    let swept = sweep_ground_target(
+        &ctx.bounds,
+        player_ground,
         Vec2::new(point.x, point.z),
         PLAYER_COLLISION_RADIUS,
-    ));
+        ctx.walls.iter(),
+        PLAYER_WALL_CLEARANCE,
+    );
+    player.position = Some(swept);
 }
 
 pub(super) fn handle_controller_targeting(
@@ -142,14 +168,18 @@ pub(super) fn handle_controller_targeting(
     camera_query: Option<Single<&Transform, With<MainCamera>>>,
     controller_move: Single<&ControllerMove, With<Player>>,
     player: Single<&Transform, With<Player>>,
-    targetables: Query<(Entity, &GlobalTransform), With<Targetable>>,
-    mut target_state: ResMut<TargetState>,
+    mut ctx: ControllerTargetingContext<'_, '_>,
     mut right_stick_released: Local<bool>,
 ) {
-    if let Some(targeted) = target_state.targeted
-        && targetables.get(targeted).is_err()
-    {
-        target_state.targeted = None;
+    if let Some(targeted) = ctx.target_state.targeted {
+        if ctx
+            .targetables
+            .get(targeted)
+            .ok()
+            .is_none_or(|(_, _, visibility)| *visibility == Visibility::Hidden)
+        {
+            ctx.target_state.targeted = None;
+        }
     }
 
     if let Some(camera_tf) = camera_query {
@@ -163,14 +193,24 @@ pub(super) fn handle_controller_targeting(
             right_input.length_squared() >= TARGET_SWITCH_DEADZONE * TARGET_SWITCH_DEADZONE;
 
         if right_active && *right_stick_released {
-            let excluded = target_state.targeted;
-            if let Some(target) =
-                find_directional_target(player.translation, right_input, excluded, &targetables)
-                    .or_else(|| {
-                        find_directional_target(player.translation, right_input, None, &targetables)
-                    })
-            {
-                target_state.targeted = Some(target);
+            let excluded = ctx.target_state.targeted;
+            if let Some(target) = find_directional_target(
+                player.translation,
+                right_input,
+                excluded,
+                &ctx.targetables,
+                &ctx.walls,
+            )
+            .or_else(|| {
+                find_directional_target(
+                    player.translation,
+                    right_input,
+                    None,
+                    &ctx.targetables,
+                    &ctx.walls,
+                )
+            }) {
+                ctx.target_state.targeted = Some(target);
             }
             *right_stick_released = false;
         } else if !right_active {
@@ -182,42 +222,53 @@ pub(super) fn handle_controller_targeting(
 
     if controller_move.active() {
         let direction = controller_move.input;
-        let keep_current = target_state
+        let keep_current = ctx
+            .target_state
             .targeted
-            .and_then(|entity| targetables.get(entity).ok())
-            .is_some_and(|(_, transform)| {
-                target_in_direction(player.translation, direction, transform.translation())
-            });
+            .and_then(|entity| ctx.targetables.get(entity).ok())
+            .is_some_and(
+                |(_, transform, visibility): (Entity, &GlobalTransform, &Visibility)| {
+                    *visibility != Visibility::Hidden
+                        && target_in_direction(
+                            player.translation,
+                            direction,
+                            transform.translation(),
+                        )
+                        && target_visible_from_player(
+                            player.translation,
+                            transform.translation(),
+                            &ctx.walls,
+                        )
+                },
+            );
 
         if !keep_current {
-            target_state.targeted =
-                find_directional_target(player.translation, direction, None, &targetables);
+            ctx.target_state.targeted = find_directional_target(
+                player.translation,
+                direction,
+                None,
+                &ctx.targetables,
+                &ctx.walls,
+            );
         }
     }
 }
 
 pub(super) fn chase_and_attack_target(
     controls: AttackControls<'_, '_>,
-    target_transforms: Query<&GlobalTransform, With<Targetable>>,
-    controller_move: Single<&ControllerMove, With<Player>>,
+    target_transforms: Query<(&GlobalTransform, &Visibility), With<Targetable>>,
+    walls: PlayerWallQuery<'_, '_>,
     mut player: AttackPlayer<'_>,
     mut attack_intent: Local<AttackIntent>,
 ) {
-    let Some(target_entity) = controls.target_state.targeted else {
-        attack_intent.clear();
-        return;
-    };
-    let Ok(target_tf) = target_transforms.get(target_entity) else {
-        attack_intent.clear();
-        return;
-    };
+    let (attack_pressed, attack_held) = resolve_attack_input(
+        controls.target_state.targeted.is_some(),
+        controls.mouse_buttons.just_pressed(MouseButton::Left),
+        controls.mouse_buttons.pressed(MouseButton::Left),
+        any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger),
+        any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger),
+    );
 
-    let attack_pressed = controls.mouse_buttons.just_pressed(MouseButton::Left)
-        || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger);
-    let attack_held = controls.mouse_buttons.pressed(MouseButton::Left)
-        || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger);
-
-    // Click / bumper sets a pending strike that survives the walk; hold = continuous
     if attack_pressed {
         attack_intent.pending_strike = true;
         attack_intent.holding = true;
@@ -226,51 +277,82 @@ pub(super) fn chase_and_attack_target(
         attack_intent.holding = false;
     }
 
-    let (ref mut player_tf, ref mut move_target, ref mut animator, ref mut combat, ref mut stats) =
-        *player;
-    let target_pos = target_tf.translation();
-    let to_target = Vec3::new(
-        target_pos.x - player_tf.translation.x,
-        0.0,
-        target_pos.z - player_tf.translation.z,
-    );
-    let distance = to_target.length();
+    let (
+        ref mut player_tf,
+        ref mut move_target,
+        controller_move,
+        ref mut animator,
+        ref mut combat,
+        ref mut stats,
+    ) = *player;
 
-    if distance > 0.001 {
-        player_tf.look_to(-to_target.normalize(), Vec3::Y);
-    }
+    // Resolve target: face it, chase it if needed
+    let has_target = if let Some(target_entity) = controls.target_state.targeted {
+        if let Ok((target_tf, visibility)) = target_transforms.get(target_entity) {
+            if *visibility == Visibility::Hidden {
+                move_target.position = None;
+                attack_intent.windup = 0.0;
+                false
+            } else {
+                let target_pos = target_tf.translation();
+                let to_target = Vec3::new(
+                    target_pos.x - player_tf.translation.x,
+                    0.0,
+                    target_pos.z - player_tf.translation.z,
+                );
+                let distance = to_target.length();
+                let clear_path = segment_clear_of_walls(
+                    Vec2::new(player_tf.translation.x, player_tf.translation.z),
+                    Vec2::new(target_pos.x, target_pos.z),
+                    PLAYER_COLLISION_RADIUS,
+                    walls.iter(),
+                );
+
+                if distance > 0.001 {
+                    player_tf.look_to(-to_target.normalize(), Vec3::Y);
+                }
+
+                let can_attack = attack_intent.pending_strike || attack_intent.holding;
+
+                // Chase toward target if out of range
+                if can_attack && clear_path && distance > ATTACK_RANGE && !controller_move.active()
+                {
+                    move_target.position = Some(clamp_ground_target(
+                        &controls.bounds,
+                        Vec2::new(target_pos.x, target_pos.z),
+                        PLAYER_COLLISION_RADIUS,
+                    ));
+                    if distance > ATTACK_RANGE * 1.5 {
+                        attack_intent.windup = 0.0;
+                    }
+                } else {
+                    move_target.position = None;
+                    if !can_attack || !clear_path {
+                        attack_intent.windup = 0.0;
+                    }
+                }
+
+                clear_path && distance <= ATTACK_RANGE
+            }
+        } else {
+            true // target entity exists but transform gone — allow swing anyway
+        }
+    } else {
+        true // no target — always allow swing in facing direction
+    };
 
     let can_attack = attack_intent.pending_strike || attack_intent.holding;
 
-    if can_attack && distance > ATTACK_RANGE && !controller_move.active() {
-        move_target.position = Some(clamp_ground_target_to_arena(
-            Vec2::new(target_pos.x, target_pos.z),
-            PLAYER_COLLISION_RADIUS,
-        ));
-        if distance > ATTACK_RANGE * 1.5 {
-            attack_intent.windup = 0.0;
-        }
-    } else {
-        move_target.position = None;
-        if !can_attack {
-            attack_intent.windup = 0.0;
-        }
-    }
-
-    if can_attack && animator.swing_timer.finished() {
-        attack_intent.windup += controls.time.delta_secs();
-        if attack_intent.windup >= ATTACK_WINDUP
-            && distance <= ATTACK_RANGE
-            && stats.spend_stamina(ATTACK_STAMINA_COST)
-        {
-            attack_intent.pending_strike = false;
-            attack_intent.windup = 0.0;
-            animator.swing_timer.reset();
-            combat.swing_id = combat.swing_id.wrapping_add(1);
-            combat.strike = 0.0;
-        }
-    } else if !can_attack {
-        attack_intent.windup = 0.0;
+    if advance_attack_windup(
+        &mut attack_intent,
+        can_attack && has_target,
+        animator.swing_timer.finished(),
+        controls.time.delta_secs(),
+    ) && stats.spend_stamina(ATTACK_STAMINA_COST)
+    {
+        animator.swing_timer.reset();
+        combat.swing_id = combat.swing_id.wrapping_add(1);
+        combat.strike = 0.0;
     }
 }
 
@@ -316,6 +398,8 @@ pub(super) fn trigger_dodge(
 
 pub(super) fn update_dodge(
     time: Res<Time>,
+    bounds: Res<FloorBounds>,
+    walls: PlayerWallQuery<'_, '_>,
     mut player: Single<(&mut Transform, &mut Dodge), With<Player>>,
 ) {
     let (ref mut player_tf, ref mut dodge) = *player;
@@ -332,10 +416,20 @@ pub(super) fn update_dodge(
     let progress = dodge_progress(dodge);
     let step = DODGE_DISTANCE
         * (dodge_motion_curve(progress) - dodge_motion_curve(previous_progress)).max(0.0);
-    player_tf.translation += dodge.direction * step;
-    clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+    let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+    let desired_end = current + Vec2::new(dodge.direction.x, dodge.direction.z) * step;
+    let swept = sweep_ground_target(
+        &bounds,
+        current,
+        desired_end,
+        PLAYER_COLLISION_RADIUS,
+        walls.iter(),
+        PLAYER_WALL_CLEARANCE,
+    );
+    player_tf.translation.x = swept.x;
+    player_tf.translation.z = swept.y;
 
-    if previous_progress >= 1.0 {
+    if progress >= 1.0 {
         dodge.active = false;
     }
 }
@@ -383,6 +477,8 @@ pub(super) fn move_player_with_controller(
         With<Player>,
     >,
     time: Res<Time>,
+    bounds: Res<FloorBounds>,
+    walls: PlayerWallQuery<'_, '_>,
 ) {
     let (ref mut player_tf, ref mut move_target, controller_move, dodge) = *player_query;
 
@@ -404,14 +500,25 @@ pub(super) fn move_player_with_controller(
     }
 
     let step = MOVE_SPEED * magnitude * time.delta_secs();
-    player_tf.translation.x += direction.x * step;
-    player_tf.translation.z += direction.y * step;
-    clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+    let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+    let desired_end = current + direction * step;
+    let swept = sweep_ground_target(
+        &bounds,
+        current,
+        desired_end,
+        PLAYER_COLLISION_RADIUS,
+        walls.iter(),
+        PLAYER_WALL_CLEARANCE,
+    );
+    player_tf.translation.x = swept.x;
+    player_tf.translation.z = swept.y;
 }
 
 pub(super) fn move_player(
     mut player_query: Single<(&mut Transform, &mut MoveTarget, &Dodge), With<Player>>,
     time: Res<Time>,
+    bounds: Res<FloorBounds>,
+    walls: PlayerWallQuery<'_, '_>,
 ) {
     let (ref mut player_tf, ref mut move_target, dodge) = *player_query;
 
@@ -439,16 +546,26 @@ pub(super) fn move_player(
     }
 
     let step_mag = MOVE_SPEED * time.delta_secs();
-    if step_mag >= distance {
-        player_tf.translation.x = target_position.x;
-        player_tf.translation.z = target_position.y;
-        move_target.position = None;
+    let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+    let desired_end = if step_mag >= distance {
+        target_position
     } else {
-        player_tf.translation.x += direction.x * step_mag;
-        player_tf.translation.z += direction.y * step_mag;
-    }
+        current + direction * step_mag
+    };
+    let swept = sweep_ground_target(
+        &bounds,
+        current,
+        desired_end,
+        PLAYER_COLLISION_RADIUS,
+        walls.iter(),
+        PLAYER_WALL_CLEARANCE,
+    );
+    player_tf.translation.x = swept.x;
+    player_tf.translation.z = swept.y;
 
-    clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+    if step_mag >= distance && swept.distance_squared(target_position) <= 0.0001 {
+        move_target.position = None;
+    }
 }
 
 fn any_gamepad_just_pressed(gamepads: &Query<&Gamepad>, button: GamepadButton) -> bool {
@@ -457,6 +574,41 @@ fn any_gamepad_just_pressed(gamepads: &Query<&Gamepad>, button: GamepadButton) -
 
 fn any_gamepad_pressed(gamepads: &Query<&Gamepad>, button: GamepadButton) -> bool {
     gamepads.iter().any(|gamepad| gamepad.pressed(button))
+}
+
+fn resolve_attack_input(
+    mouse_target_locked: bool,
+    mouse_pressed: bool,
+    mouse_held: bool,
+    gamepad_pressed: bool,
+    gamepad_held: bool,
+) -> (bool, bool) {
+    let mouse_attack_pressed = mouse_target_locked && mouse_pressed;
+    let mouse_attack_held = mouse_target_locked && mouse_held;
+    (
+        mouse_attack_pressed || gamepad_pressed,
+        mouse_attack_held || gamepad_held,
+    )
+}
+
+fn advance_attack_windup(
+    attack_intent: &mut AttackIntent,
+    can_attack: bool,
+    swing_ready: bool,
+    delta_secs: f32,
+) -> bool {
+    if can_attack && swing_ready {
+        attack_intent.windup += delta_secs;
+        if attack_intent.windup >= ATTACK_WINDUP {
+            attack_intent.pending_strike = false;
+            attack_intent.windup = 0.0;
+            return true;
+        }
+    } else if !can_attack {
+        attack_intent.windup = 0.0;
+    }
+
+    false
 }
 
 fn strongest_stick_direction(
@@ -507,7 +659,8 @@ fn find_directional_target(
     player_translation: Vec3,
     direction: Vec2,
     excluded: Option<Entity>,
-    targetables: &Query<(Entity, &GlobalTransform), With<Targetable>>,
+    targetables: &DirectionalTargetables<'_, '_>,
+    walls: &PlayerWallQuery<'_, '_>,
 ) -> Option<Entity> {
     let direction_len_sq = direction.length_squared();
     if direction_len_sq <= 0.0001 {
@@ -518,7 +671,11 @@ fn find_directional_target(
     let player_ground = Vec2::new(player_translation.x, player_translation.z);
     let mut best: Option<(Entity, f32)> = None;
 
-    for (entity, transform) in targetables.iter() {
+    for (entity, transform, visibility) in targetables.iter() {
+        if *visibility == Visibility::Hidden {
+            continue;
+        }
+        let transform: &GlobalTransform = transform;
         if Some(entity) == excluded {
             continue;
         }
@@ -528,7 +685,10 @@ fn find_directional_target(
             transform.translation().z - player_ground.y,
         );
         let distance_sq = to_enemy.length_squared();
-        if distance_sq <= 0.0001 {
+        if distance_sq <= 0.0001 || distance_sq > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE {
+            continue;
+        }
+        if !target_visible_from_player(player_translation, transform.translation(), walls) {
             continue;
         }
 
@@ -544,6 +704,19 @@ fn find_directional_target(
     }
 
     best.map(|(entity, _)| entity)
+}
+
+fn target_visible_from_player(
+    player_translation: Vec3,
+    target_translation: Vec3,
+    walls: &PlayerWallQuery<'_, '_>,
+) -> bool {
+    segment_clear_of_walls(
+        Vec2::new(player_translation.x, player_translation.z),
+        Vec2::new(target_translation.x, target_translation.z),
+        0.0,
+        walls.iter(),
+    )
 }
 
 fn target_in_direction(
@@ -566,4 +739,40 @@ fn target_in_direction(
     }
 
     to_enemy.normalize().dot(direction) >= TARGET_DIRECTION_DOT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ground_click_does_not_arm_mouse_attack_without_target() {
+        assert_eq!(
+            resolve_attack_input(false, true, true, false, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn targeted_click_arms_mouse_attack() {
+        assert_eq!(
+            resolve_attack_input(true, true, true, false, false),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn failed_single_click_is_consumed_after_windup() {
+        let mut intent = AttackIntent {
+            pending_strike: true,
+            holding: false,
+            windup: ATTACK_WINDUP - 0.01,
+        };
+
+        assert!(advance_attack_windup(&mut intent, true, true, 0.02));
+        assert!(!intent.pending_strike);
+        assert!(!intent.holding);
+        assert_eq!(intent.windup, 0.0);
+        assert!(!advance_attack_windup(&mut intent, false, true, 0.02));
+    }
 }

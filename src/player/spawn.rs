@@ -3,19 +3,22 @@ use std::f32::consts::PI;
 use bevy::prelude::*;
 
 use crate::combat::{FlashTint, HitFlash, HitPoints};
-use crate::world::tilemap::{PLAYER_SPAWN_GRID, grid_to_world};
+use crate::world::floor::FloorMap;
 
 use super::{
-    ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget,
-    PLAYER_MAX_HP, Player, PlayerCombat, PlayerStats,
+    ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint, MoveTarget, Player,
+    PlayerCombat, PlayerStats, PLAYER_MAX_HP,
 };
 
 pub(super) fn spawn_player(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    floor_map: Option<Res<FloorMap>>,
 ) {
-    let start = grid_to_world(PLAYER_SPAWN_GRID.0, PLAYER_SPAWN_GRID.1);
+    let start = floor_map
+        .map(|fm| fm.rooms[fm.start_room].world_center)
+        .unwrap_or(Vec3::ZERO);
 
     let steel_color = Vec3::new(0.70, 0.74, 0.80);
     let dark_steel_color = Vec3::new(0.18, 0.21, 0.26);

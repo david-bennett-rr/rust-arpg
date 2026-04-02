@@ -1,9 +1,9 @@
 use bevy::prelude::*;
 use bevy::render::{
-    RenderPlugin,
     settings::{Backends, InstanceFlags, PowerPreference, WgpuSettings},
+    RenderPlugin,
 };
-use bevy::window::{PresentMode, WindowMode};
+use bevy::window::PresentMode;
 
 mod camera;
 mod combat;
@@ -12,6 +12,7 @@ mod debug;
 mod enemy;
 mod hud;
 mod player;
+mod rng;
 mod targeting;
 mod world;
 
@@ -34,7 +35,6 @@ fn main() {
                     title: "Rust ARPG".to_string(),
                     resolution: (1280.0, 720.0).into(),
                     present_mode: default_present_mode(),
-                    mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                     ..default()
                 }),
                 ..default()
@@ -88,7 +88,7 @@ fn default_present_mode() -> PresentMode {
 fn preferred_backends() -> Backends {
     #[cfg(target_os = "windows")]
     {
-        Backends::VULKAN
+        Backends::PRIMARY
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -2,11 +2,11 @@ use std::f32::consts::PI;
 
 use bevy::prelude::*;
 
-use crate::combat::{HitPoints, smoothstep01};
+use crate::combat::{smoothstep01, HitPoints};
 
 use super::{
-    ControllerMove, DEATH_ANIM_DURATION, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint,
-    MoveTarget, Player, PlayerCombat, dodge_motion_curve,
+    dodge_motion_curve, ControllerMove, DeathAnim, Dodge, JointRest, KnightAnimator, KnightJoint,
+    MoveTarget, Player, PlayerCombat, DEATH_ANIM_DURATION,
 };
 
 type AnimatedPlayer<'w> = Single<

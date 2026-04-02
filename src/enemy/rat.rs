@@ -1,15 +1,19 @@
 use std::f32::consts::PI;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::combat::{DamageRng, FlashTint, HitFlash, HitPoints, StunMeter, smoothstep01};
+use crate::combat::{smoothstep01, DamageRng, FlashTint, HitFlash, HitPoints, StunMeter};
 use crate::player::{Dodge, Player, PlayerCombat};
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
-use crate::world::tilemap::{clamp_translation_to_arena, grid_to_world};
+use crate::world::fog::FogDynamic;
+use crate::world::tilemap::{
+    sweep_ground_target, FloorBounds, Wall, WallCollider, WallSpatialIndex,
+};
 
 use super::{
-    Dying, EnemyCollision, SlashTarget, UniqueEnemyMaterials, build_player_slash_state,
-    try_player_slash,
+    build_player_slash_state, try_player_slash, Dying, EnemyCollision, SlashTarget,
+    UniqueEnemyMaterials,
 };
 
 #[derive(Component)]
@@ -19,6 +23,7 @@ pub struct DemonRat {
     move_blend: f32,
     attack_cooldown: f32,
     chomp: f32,
+    recovery: f32,
     attack_hit_applied: bool,
     last_hit_swing_id: u32,
     alerted: bool,
@@ -75,6 +80,19 @@ type RatActors<'w, 's> = Query<
     (Without<Player>, Without<Dying>),
 >;
 
+type RatWallQuery<'w, 's> =
+    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<DemonRat>)>;
+
+#[derive(SystemParam)]
+pub(super) struct RatUpdateContext<'w, 's> {
+    commands: Commands<'w, 's>,
+    bounds: Res<'w, FloorBounds>,
+    wall_index: Res<'w, WallSpatialIndex>,
+    walls: RatWallQuery<'w, 's>,
+    damage_rng: ResMut<'w, DamageRng>,
+    target_state: ResMut<'w, TargetState>,
+}
+
 const RAT_MOVE_SPEED: f32 = 3.25;
 const RAT_AGGRO_RANGE: f32 = 11.0;
 const RAT_ATTACK_RANGE: f32 = 1.5;
@@ -87,22 +105,14 @@ const RAT_BITE_HIT_PROGRESS: f32 = 0.58;
 const RAT_BITE_REACH: f32 = 1.48;
 const RAT_HP: i32 = 8;
 const RAT_COLLISION_RADIUS: f32 = 0.58;
-
-pub(super) const RAT_SPAWN_POINTS: [(i32, i32); 6] =
-    [(6, 8), (8, 14), (13, 6), (15, 11), (12, 15), (4, 11)];
-
-pub(super) fn spawn_demon_rats(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    do_spawn_rats(&mut commands, &mut meshes, &mut materials);
-}
+const RAT_RECOVERY_DURATION: f32 = 0.7;
+const RAT_WALL_CLEARANCE: f32 = 0.04;
 
 pub(super) fn do_spawn_rats(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    spawn_positions: &[Vec3],
 ) {
     let fur_color = Vec3::new(0.24, 0.06, 0.07);
     let dark_fur_color = Vec3::new(0.10, 0.02, 0.03);
@@ -158,8 +168,7 @@ pub(super) fn do_spawn_rats(
         ..default()
     });
 
-    for &(gx, gz) in &RAT_SPAWN_POINTS {
-        let home = grid_to_world(gx, gz);
+    for &home in spawn_positions {
         let rat = commands
             .spawn((
                 DemonRat {
@@ -168,6 +177,7 @@ pub(super) fn do_spawn_rats(
                     move_blend: 0.0,
                     attack_cooldown: 0.25,
                     chomp: 0.0,
+                    recovery: 0.0,
                     attack_hit_applied: false,
                     last_hit_swing_id: 0,
                     alerted: false,
@@ -184,9 +194,10 @@ pub(super) fn do_spawn_rats(
                 HitPoints::new(RAT_HP),
                 StunMeter::new(4.0, 2.5, 1.5),
                 HitFlash::default(),
+                FogDynamic::default(),
                 UniqueEnemyMaterials,
                 Transform::from_translation(home),
-                Visibility::Visible,
+                Visibility::Hidden,
             ))
             .id();
 
@@ -376,12 +387,10 @@ pub(super) fn do_spawn_rats(
 }
 
 pub(super) fn update_demon_rats(
-    mut commands: Commands,
     time: Res<Time>,
+    mut ctx: RatUpdateContext<'_, '_>,
     mut player: RatPlayer<'_>,
     mut rats: RatActors<'_, '_>,
-    mut damage_rng: ResMut<DamageRng>,
-    mut target_state: ResMut<TargetState>,
 ) {
     let delta = time.delta_secs();
     let (
@@ -397,24 +406,37 @@ pub(super) fn update_demon_rats(
         &mut rats
     {
         rat.attack_cooldown = (rat.attack_cooldown - delta).max(0.0);
+        let prev_chomp = rat.chomp;
         rat.chomp = (rat.chomp - delta / RAT_ATTACK_DURATION).max(0.0);
+        // Start recovery when attack finishes
+        if prev_chomp > 0.0 && rat.chomp <= 0.0 {
+            rat.recovery = RAT_RECOVERY_DURATION;
+        }
+        rat.recovery = (rat.recovery - delta).max(0.0);
         transform.translation.y = 0.0;
 
         let rat_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
-        if try_player_slash(
-            &mut commands,
-            entity,
-            rat_ground,
-            SlashTarget {
-                last_hit_swing_id: &mut rat.last_hit_swing_id,
-                health: rat_health,
-                stun: rat_stun,
-                flash: rat_flash,
-            },
-            player_slash,
-            &mut damage_rng,
-            &mut target_state,
-        ) {
+        let player_clear_path = ctx.wall_index.segment_clear(
+            Vec2::new(player_ground.x, player_ground.z),
+            Vec2::new(rat_ground.x, rat_ground.z),
+            0.0,
+        );
+        if player_clear_path
+            && try_player_slash(
+                &mut ctx.commands,
+                entity,
+                rat_ground,
+                SlashTarget {
+                    last_hit_swing_id: &mut rat.last_hit_swing_id,
+                    health: rat_health,
+                    stun: rat_stun,
+                    flash: rat_flash,
+                },
+                player_slash,
+                &mut ctx.damage_rng,
+                &mut ctx.target_state,
+            )
+        {
             continue;
         }
 
@@ -425,12 +447,23 @@ pub(super) fn update_demon_rats(
             continue;
         }
 
+        // Recovering after an attack — stay still
+        if rat.recovery > 0.0 {
+            rat.move_blend = 0.0;
+            continue;
+        }
+
         let to_player = player_ground - rat_ground;
         let player_distance = to_player.length();
         let to_home = rat.home - rat_ground;
         let home_distance = to_home.length();
+        let clear_path_to_player = ctx.wall_index.segment_clear(
+            Vec2::new(rat_ground.x, rat_ground.z),
+            Vec2::new(player_ground.x, player_ground.z),
+            RAT_COLLISION_RADIUS,
+        );
 
-        let chasing_player = player_distance <= RAT_AGGRO_RANGE;
+        let chasing_player = player_distance <= RAT_AGGRO_RANGE && clear_path_to_player;
         rat.alerted = chasing_player;
 
         let mut move_direction = Vec3::ZERO;
@@ -463,12 +496,28 @@ pub(super) fn update_demon_rats(
                 home_distance
             };
             let travel = step.min(remaining);
-            transform.translation += move_direction * travel;
-            clamp_translation_to_arena(&mut transform.translation, RAT_COLLISION_RADIUS);
-            transform.look_to(-move_direction, Vec3::Y);
-            rat.gait_phase += delta * 12.0;
-            rat.gait_phase %= 100.0 * std::f32::consts::TAU;
-            rat.move_blend = 1.0;
+            let current = Vec2::new(transform.translation.x, transform.translation.z);
+            let desired_end = current + Vec2::new(move_direction.x, move_direction.z) * travel;
+            let swept = sweep_ground_target(
+                &ctx.bounds,
+                current,
+                desired_end,
+                RAT_COLLISION_RADIUS,
+                ctx.walls.iter(),
+                RAT_WALL_CLEARANCE,
+            );
+            let moved_distance = swept.distance(current);
+            transform.translation.x = swept.x;
+            transform.translation.z = swept.y;
+
+            if moved_distance > 0.0001 {
+                transform.look_to(-move_direction, Vec3::Y);
+                rat.gait_phase += delta * 12.0;
+                rat.gait_phase %= 100.0 * std::f32::consts::TAU;
+                rat.move_blend = 1.0;
+            } else {
+                rat.move_blend = 0.0;
+            }
         } else {
             if chasing_player && player_distance > 0.001 {
                 transform.look_to(-to_player.normalize_or_zero(), Vec3::Y);
@@ -481,8 +530,18 @@ pub(super) fn update_demon_rats(
             let lunge = (hop * delta * RAT_LUNGE_SPEED).min(0.18);
             let forward = transform.rotation * Vec3::Z;
             transform.translation.y = hop * RAT_HOP_HEIGHT;
-            transform.translation += forward * lunge;
-            clamp_translation_to_arena(&mut transform.translation, RAT_COLLISION_RADIUS);
+            let current = Vec2::new(transform.translation.x, transform.translation.z);
+            let desired_end = current + Vec2::new(forward.x, forward.z) * lunge;
+            let swept = sweep_ground_target(
+                &ctx.bounds,
+                current,
+                desired_end,
+                RAT_COLLISION_RADIUS,
+                ctx.walls.iter(),
+                RAT_WALL_CLEARANCE,
+            );
+            transform.translation.x = swept.x;
+            transform.translation.z = swept.y;
             let bite_distance = super::horizontal_distance(player_ground, transform.translation);
 
             if !rat.attack_hit_applied

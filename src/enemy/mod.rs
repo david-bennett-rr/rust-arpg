@@ -4,15 +4,16 @@ mod rat;
 
 use std::collections::HashMap;
 
+use bevy::ecs::system::SystemParam;
 use bevy::{asset::AssetId, prelude::*};
 use smallvec::SmallVec;
 
-use crate::combat::{DamageRng, HitFlash, HitPoints, StunMeter, game_running, smoothstep01};
+use crate::combat::{game_running, smoothstep01, DamageRng, HitFlash, HitPoints, StunMeter};
 use crate::player::{
-    Dodge, PLAYER_COLLISION_RADIUS, Player, PlayerCombat, PlayerSet, visual_forward,
+    visual_forward, Dodge, Player, PlayerCombat, PlayerSet, PLAYER_COLLISION_RADIUS,
 };
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
-use crate::world::tilemap::clamp_translation_to_arena;
+use crate::world::tilemap::{clamp_translation, FloorBounds};
 
 pub use arrow::Arrow;
 pub use goblin::GoblinArcher;
@@ -27,15 +28,7 @@ impl Plugin for EnemyPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<RespawnEnemies>()
             .add_systems(PreUpdate, instance_enemy_materials)
-            .add_systems(
-                Startup,
-                (
-                    rat::spawn_demon_rats,
-                    arrow::setup_arrow_meshes,
-                    goblin::spawn_goblin_archers,
-                )
-                    .chain(),
-            )
+            .add_systems(Startup, arrow::setup_arrow_meshes)
             .add_systems(
                 Update,
                 (
@@ -111,6 +104,14 @@ type EnemyActors<'w, 's> = Query<
     (With<EnemyCollision>, Without<Player>),
 >;
 
+#[derive(SystemParam)]
+struct EnemyRespawnContext<'w, 's> {
+    commands: Commands<'w, 's>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    floor_map: Option<Res<'w, crate::world::floor::FloorMap>>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PlayerSlashState<'a> {
     pub(crate) ground: Vec3,
@@ -129,6 +130,7 @@ pub(crate) struct SlashTarget<'a> {
 const PLAYER_SLASH_RANGE: f32 = 2.5;
 const PLAYER_SLASH_ARC_DOT: f32 = 0.08;
 const COLLISION_EPSILON: f32 = 0.001;
+const ENEMY_COLLISION_CELL_SIZE: f32 = 2.0;
 
 pub(crate) fn build_player_slash_state<'a>(
     transform: &Transform,
@@ -189,6 +191,7 @@ pub(crate) fn try_player_slash(
 }
 
 fn resolve_actor_collisions(
+    bounds: Res<FloorBounds>,
     mut player: CollisionPlayer<'_>,
     enemy_entities: Query<Entity, With<EnemyCollision>>,
     mut enemy_transforms: EnemyActors<'_, '_>,
@@ -216,36 +219,65 @@ fn resolve_actor_collisions(
                 player_tf.translation.z = player_ground.y;
                 enemy_transform.translation.x = enemy_ground.x;
                 enemy_transform.translation.z = enemy_ground.y;
-                clamp_translation_to_arena(&mut player_tf.translation, PLAYER_COLLISION_RADIUS);
-                clamp_translation_to_arena(&mut enemy_transform.translation, collision.radius);
+                clamp_translation(&bounds, &mut player_tf.translation, PLAYER_COLLISION_RADIUS);
+                clamp_translation(&bounds, &mut enemy_transform.translation, collision.radius);
                 player_ground = horizontal_position(player_tf.translation);
             }
         }
     }
 
-    for i in 0..enemy_ids.len() {
-        for j in (i + 1)..enemy_ids.len() {
-            let Ok([(collision_a, mut enemy_a), (collision_b, mut enemy_b)]) =
-                enemy_transforms.get_many_mut([enemy_ids[i], enemy_ids[j]])
-            else {
-                continue;
-            };
-            let mut a_ground = horizontal_position(enemy_a.translation);
-            let mut b_ground = horizontal_position(enemy_b.translation);
-            let separated = resolve_overlap(
-                &mut a_ground,
-                &mut b_ground,
-                collision_a.radius + collision_b.radius,
-                0.5,
-            );
+    let mut enemy_cells: HashMap<IVec2, SmallVec<[Entity; 8]>> = HashMap::new();
+    let mut enemy_snapshots: SmallVec<[(Entity, Vec2); 16]> = SmallVec::new();
+    for enemy_id in &enemy_ids {
+        let Ok((_, enemy_transform)) = enemy_transforms.get_mut(*enemy_id) else {
+            continue;
+        };
+        let position = horizontal_position(enemy_transform.translation);
+        enemy_cells
+            .entry(enemy_collision_cell(position))
+            .or_default()
+            .push(*enemy_id);
+        enemy_snapshots.push((*enemy_id, position));
+    }
 
-            if separated {
-                enemy_a.translation.x = a_ground.x;
-                enemy_a.translation.z = a_ground.y;
-                enemy_b.translation.x = b_ground.x;
-                enemy_b.translation.z = b_ground.y;
-                clamp_translation_to_arena(&mut enemy_a.translation, collision_a.radius);
-                clamp_translation_to_arena(&mut enemy_b.translation, collision_b.radius);
+    for (enemy_id, position) in enemy_snapshots {
+        let center_cell = enemy_collision_cell(position);
+
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let Some(cell_enemies) = enemy_cells.get(&(center_cell + IVec2::new(dx, dz)))
+                else {
+                    continue;
+                };
+
+                for &other_id in cell_enemies {
+                    if other_id.to_bits() <= enemy_id.to_bits() {
+                        continue;
+                    }
+
+                    let Ok([(collision_a, mut enemy_a), (collision_b, mut enemy_b)]) =
+                        enemy_transforms.get_many_mut([enemy_id, other_id])
+                    else {
+                        continue;
+                    };
+                    let mut a_ground = horizontal_position(enemy_a.translation);
+                    let mut b_ground = horizontal_position(enemy_b.translation);
+                    let separated = resolve_overlap(
+                        &mut a_ground,
+                        &mut b_ground,
+                        collision_a.radius + collision_b.radius,
+                        0.5,
+                    );
+
+                    if separated {
+                        enemy_a.translation.x = a_ground.x;
+                        enemy_a.translation.z = a_ground.y;
+                        enemy_b.translation.x = b_ground.x;
+                        enemy_b.translation.z = b_ground.y;
+                        clamp_translation(&bounds, &mut enemy_a.translation, collision_a.radius);
+                        clamp_translation(&bounds, &mut enemy_b.translation, collision_b.radius);
+                    }
+                }
             }
         }
     }
@@ -313,6 +345,13 @@ fn resolve_overlap(a: &mut Vec2, b: &mut Vec2, minimum_distance: f32, a_push_rat
     *a -= direction * a_push;
     *b += direction * b_push;
     true
+}
+
+fn enemy_collision_cell(position: Vec2) -> IVec2 {
+    IVec2::new(
+        (position.x / ENEMY_COLLISION_CELL_SIZE).floor() as i32,
+        (position.y / ENEMY_COLLISION_CELL_SIZE).floor() as i32,
+    )
 }
 
 fn update_dying(
@@ -417,13 +456,11 @@ fn animate_dying_goblins(
 }
 
 fn handle_respawn_enemies(
-    mut commands: Commands,
     mut events: EventReader<RespawnEnemies>,
     rats: Query<Entity, With<DemonRat>>,
     goblins: Query<Entity, With<GoblinArcher>>,
     arrows: Query<Entity, With<Arrow>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ctx: EnemyRespawnContext<'_, '_>,
 ) {
     if events.is_empty() {
         return;
@@ -432,16 +469,51 @@ fn handle_respawn_enemies(
 
     // Despawn all enemies and arrows
     for e in &rats {
-        commands.entity(e).despawn_recursive();
+        ctx.commands.entity(e).despawn_recursive();
     }
     for e in &goblins {
-        commands.entity(e).despawn_recursive();
+        ctx.commands.entity(e).despawn_recursive();
     }
     for e in &arrows {
-        commands.entity(e).despawn_recursive();
+        ctx.commands.entity(e).despawn_recursive();
     }
 
-    // Respawn — inline the spawn calls since we can't split ResMut
-    rat::do_spawn_rats(&mut commands, &mut meshes, &mut materials);
-    goblin::do_spawn_goblins(&mut commands, &mut meshes, &mut materials);
+    // Respawn from the floor map
+    let Some(floor_map) = ctx.floor_map else {
+        return;
+    };
+    spawn_enemies_from_floor(
+        &mut ctx.commands,
+        &mut ctx.meshes,
+        &mut ctx.materials,
+        &floor_map,
+    );
+}
+
+/// Spawn all enemies defined in the floor map's room templates.
+pub(crate) fn spawn_enemies_from_floor(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    floor_map: &crate::world::floor::FloorMap,
+) {
+    use crate::world::room::EnemySlot;
+    use crate::world::tilemap::grid_to_world;
+
+    let mut rat_positions = Vec::new();
+    let mut goblin_positions = Vec::new();
+
+    for placed in &floor_map.rooms {
+        let template = &floor_map.templates[placed.template_index];
+        for enemy in &template.enemies {
+            let pos = grid_to_world(placed.world_center, template, enemy.grid_x, enemy.grid_z);
+            match enemy.kind {
+                EnemySlot::Rat => rat_positions.push(pos),
+                EnemySlot::Goblin => goblin_positions.push(pos),
+            }
+        }
+    }
+
+    rat::do_spawn_rats(commands, meshes, materials, &rat_positions);
+    goblin::do_spawn_goblins(commands, meshes, materials, &goblin_positions);
 }

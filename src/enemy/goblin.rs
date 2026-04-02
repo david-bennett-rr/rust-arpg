@@ -1,16 +1,20 @@
 use std::f32::consts::PI;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::combat::{DamageRng, FlashTint, HitFlash, HitPoints, StunMeter, smoothstep01};
+use crate::combat::{smoothstep01, DamageRng, FlashTint, HitFlash, HitPoints, StunMeter};
 use crate::player::{Player, PlayerCombat};
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
-use crate::world::tilemap::{clamp_translation_to_arena, grid_to_world};
+use crate::world::fog::FogDynamic;
+use crate::world::tilemap::{
+    sweep_ground_target, FloorBounds, Wall, WallCollider, WallSpatialIndex,
+};
 
-use super::arrow::{ArrowMeshes, spawn_arrow};
+use super::arrow::{spawn_arrow, ArrowMeshes};
 use super::{
-    Dying, EnemyCollision, SlashTarget, UniqueEnemyMaterials, build_player_slash_state,
-    try_player_slash,
+    build_player_slash_state, try_player_slash, Dying, EnemyCollision, SlashTarget,
+    UniqueEnemyMaterials,
 };
 
 #[derive(Component)]
@@ -70,6 +74,19 @@ type GoblinActors<'w, 's> = Query<
     (Without<Player>, Without<Dying>),
 >;
 
+type GoblinWallQuery<'w, 's> =
+    Query<'w, 's, (&'static Transform, &'static WallCollider), (With<Wall>, Without<GoblinArcher>)>;
+
+#[derive(SystemParam)]
+pub(super) struct GoblinUpdateContext<'w, 's> {
+    commands: Commands<'w, 's>,
+    player: GoblinPlayer<'w>,
+    arrow_meshes: Res<'w, ArrowMeshes>,
+    wall_index: Res<'w, WallSpatialIndex>,
+    damage_rng: ResMut<'w, DamageRng>,
+    target_state: ResMut<'w, TargetState>,
+}
+
 const GOBLIN_HP: i32 = 6;
 const GOBLIN_MOVE_SPEED: f32 = 2.0;
 const GOBLIN_AGGRO_RANGE: f32 = 14.0;
@@ -78,21 +95,65 @@ const GOBLIN_TOO_CLOSE: f32 = 4.5;
 const GOBLIN_SHOOT_COOLDOWN: f32 = 2.2;
 const GOBLIN_DRAW_TIME: f32 = 0.7;
 const GOBLIN_COLLISION_RADIUS: f32 = 0.75;
+const GOBLIN_WALL_CLEARANCE: f32 = 0.04;
 
-pub(super) const GOBLIN_SPAWN_POINTS: [(i32, i32); 3] = [(4, 5), (16, 7), (14, 15)];
+fn choose_flee_direction(
+    current: Vec2,
+    player: Vec2,
+    travel: f32,
+    bounds: &FloorBounds,
+    walls: &[(&Transform, &WallCollider)],
+) -> Vec3 {
+    let away = (current - player).normalize_or_zero();
+    if away == Vec2::ZERO {
+        return Vec3::ZERO;
+    }
 
-pub(super) fn spawn_goblin_archers(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    do_spawn_goblins(&mut commands, &mut meshes, &mut materials);
+    let left = Vec2::new(-away.y, away.x);
+    let candidates = [
+        away,
+        (away + left * 0.75).normalize_or_zero(),
+        (away - left * 0.75).normalize_or_zero(),
+        left,
+        -left,
+    ];
+
+    let mut best_direction = Vec2::ZERO;
+    let mut best_score = f32::NEG_INFINITY;
+
+    for candidate in candidates {
+        if candidate == Vec2::ZERO {
+            continue;
+        }
+
+        let swept = sweep_ground_target(
+            bounds,
+            current,
+            current + candidate * travel,
+            GOBLIN_COLLISION_RADIUS,
+            walls.iter().copied(),
+            GOBLIN_WALL_CLEARANCE,
+        );
+        let moved_distance = swept.distance(current);
+        if moved_distance <= 0.0001 {
+            continue;
+        }
+
+        let score = swept.distance_squared(player) + moved_distance * 0.5;
+        if score > best_score {
+            best_score = score;
+            best_direction = candidate;
+        }
+    }
+
+    Vec3::new(best_direction.x, 0.0, best_direction.y)
 }
 
 pub(super) fn do_spawn_goblins(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    spawn_positions: &[Vec3],
 ) {
     let skin_color = Vec3::new(0.30, 0.42, 0.18);
     let dark_skin_color = Vec3::new(0.20, 0.30, 0.12);
@@ -171,8 +232,7 @@ pub(super) fn do_spawn_goblins(
         ..default()
     });
 
-    for &(gx, gz) in &GOBLIN_SPAWN_POINTS {
-        let home = grid_to_world(gx, gz);
+    for &home in spawn_positions {
         let goblin = commands
             .spawn((
                 GoblinArcher {
@@ -196,9 +256,10 @@ pub(super) fn do_spawn_goblins(
                 HitPoints::new(GOBLIN_HP),
                 StunMeter::new(3.0, 3.0, 1.2),
                 HitFlash::default(),
+                FogDynamic::default(),
                 UniqueEnemyMaterials,
                 Transform::from_translation(home),
-                Visibility::Visible,
+                Visibility::Hidden,
             ))
             .id();
 
@@ -528,18 +589,17 @@ pub(super) fn do_spawn_goblins(
 }
 
 pub(super) fn update_goblin_archers(
-    mut commands: Commands,
     time: Res<Time>,
-    player: GoblinPlayer<'_>,
+    bounds: Res<FloorBounds>,
+    walls: GoblinWallQuery<'_, '_>,
+    mut ctx: GoblinUpdateContext<'_, '_>,
     mut goblins: GoblinActors<'_, '_>,
-    arrow_meshes: Res<ArrowMeshes>,
-    mut damage_rng: ResMut<DamageRng>,
-    mut target_state: ResMut<TargetState>,
 ) {
     let delta = time.delta_secs();
-    let (player_transform, player_combat) = *player;
+    let (player_transform, player_combat) = *ctx.player;
     let player_slash = build_player_slash_state(player_transform, player_combat);
     let player_ground = player_slash.ground;
+    let wall_segments: Vec<_> = walls.iter().collect();
 
     for (
         entity,
@@ -554,21 +614,28 @@ pub(super) fn update_goblin_archers(
         transform.translation.y = 0.0;
 
         let goblin_ground = Vec3::new(transform.translation.x, 0.0, transform.translation.z);
+        let player_clear_path = ctx.wall_index.segment_clear(
+            Vec2::new(player_ground.x, player_ground.z),
+            Vec2::new(goblin_ground.x, goblin_ground.z),
+            0.0,
+        );
 
-        if try_player_slash(
-            &mut commands,
-            entity,
-            goblin_ground,
-            SlashTarget {
-                last_hit_swing_id: &mut goblin.last_hit_swing_id,
-                health: goblin_health,
-                stun: goblin_stun,
-                flash: goblin_flash,
-            },
-            player_slash,
-            &mut damage_rng,
-            &mut target_state,
-        ) {
+        if player_clear_path
+            && try_player_slash(
+                &mut ctx.commands,
+                entity,
+                goblin_ground,
+                SlashTarget {
+                    last_hit_swing_id: &mut goblin.last_hit_swing_id,
+                    health: goblin_health,
+                    stun: goblin_stun,
+                    flash: goblin_flash,
+                },
+                player_slash,
+                &mut ctx.damage_rng,
+                &mut ctx.target_state,
+            )
+        {
             continue;
         }
 
@@ -582,12 +649,22 @@ pub(super) fn update_goblin_archers(
         let player_distance = to_player.length();
         let to_home = goblin.home - goblin_ground;
         let home_distance = to_home.length();
+        let clear_path_to_player = ctx.wall_index.segment_clear(
+            Vec2::new(goblin_ground.x, goblin_ground.z),
+            Vec2::new(player_ground.x, player_ground.z),
+            GOBLIN_COLLISION_RADIUS,
+        );
 
-        let chasing_player = player_distance <= GOBLIN_AGGRO_RANGE;
+        let chasing_player = player_distance <= GOBLIN_AGGRO_RANGE && clear_path_to_player;
         goblin.alerted = chasing_player;
 
         let drawing = goblin.draw_timer > 0.0;
         if drawing {
+            if !clear_path_to_player {
+                goblin.draw_timer = 0.0;
+                goblin.move_blend = 0.0;
+                continue;
+            }
             goblin.draw_timer -= delta;
             if player_distance > 0.001 {
                 transform.look_to(-to_player.normalize_or_zero(), Vec3::Y);
@@ -598,7 +675,7 @@ pub(super) fn update_goblin_archers(
                 goblin.draw_timer = 0.0;
                 let shoot_dir = to_player.normalize_or_zero();
                 let arrow_start = goblin_ground + Vec3::Y * 1.2 + shoot_dir * 0.5;
-                spawn_arrow(&mut commands, &arrow_meshes, arrow_start, shoot_dir);
+                spawn_arrow(&mut ctx.commands, &ctx.arrow_meshes, arrow_start, shoot_dir);
             }
         } else {
             let mut move_direction = Vec3::ZERO;
@@ -633,12 +710,43 @@ pub(super) fn update_goblin_archers(
                 } else {
                     step.min(home_distance)
                 };
-                transform.translation += move_direction * travel;
-                clamp_translation_to_arena(&mut transform.translation, GOBLIN_COLLISION_RADIUS);
-                transform.look_to(-move_direction, Vec3::Y);
-                goblin.gait_phase += delta * 10.0;
-                goblin.gait_phase %= 100.0 * std::f32::consts::TAU;
-                goblin.move_blend = 1.0;
+                let current = Vec2::new(transform.translation.x, transform.translation.z);
+                if fleeing {
+                    move_direction = choose_flee_direction(
+                        current,
+                        Vec2::new(player_ground.x, player_ground.z),
+                        travel,
+                        &bounds,
+                        &wall_segments,
+                    );
+                }
+
+                if move_direction.length_squared() <= 0.0 {
+                    goblin.move_blend = 0.0;
+                    continue;
+                }
+
+                let desired_end = current + Vec2::new(move_direction.x, move_direction.z) * travel;
+                let swept = sweep_ground_target(
+                    &bounds,
+                    current,
+                    desired_end,
+                    GOBLIN_COLLISION_RADIUS,
+                    wall_segments.iter().copied(),
+                    GOBLIN_WALL_CLEARANCE,
+                );
+                let moved_distance = swept.distance(current);
+                transform.translation.x = swept.x;
+                transform.translation.z = swept.y;
+
+                if moved_distance > 0.0001 {
+                    transform.look_to(-move_direction, Vec3::Y);
+                    goblin.gait_phase += delta * 10.0;
+                    goblin.gait_phase %= 100.0 * std::f32::consts::TAU;
+                    goblin.move_blend = 1.0;
+                } else {
+                    goblin.move_blend = 0.0;
+                }
             } else {
                 goblin.move_blend = 0.0;
             }
@@ -763,5 +871,39 @@ pub(super) fn animate_goblin_archers(
                         * Quat::from_rotation_z(-hold * 0.06 + tremble);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flee_direction_prefers_straight_escape_when_clear() {
+        let bounds = FloorBounds::default();
+        let direction = choose_flee_direction(Vec2::ZERO, Vec2::new(2.0, 0.0), 1.0, &bounds, &[]);
+
+        assert!(direction.x < -0.9);
+        assert!(direction.z.abs() < 0.01);
+    }
+
+    #[test]
+    fn flee_direction_uses_side_step_when_backpedal_is_blocked() {
+        let bounds = FloorBounds::default();
+        let wall_tf = Transform::from_xyz(-1.8, 0.0, 0.0);
+        let wall = WallCollider {
+            half_x: 0.15,
+            half_z: 0.05,
+        };
+        let direction = choose_flee_direction(
+            Vec2::ZERO,
+            Vec2::new(2.0, 0.0),
+            1.0,
+            &bounds,
+            &[(&wall_tf, &wall)],
+        );
+
+        assert!(direction.length_squared() > 0.0);
+        assert!(direction.z.abs() > 0.05);
     }
 }

@@ -4,7 +4,8 @@ use bevy::window::PrimaryWindow;
 use crate::camera::MainCamera;
 use crate::combat::{HitPoints, StunMeter};
 use crate::hud::PauseMenuState;
-use crate::player::PlayerSet;
+use crate::player::{Player, PlayerSet};
+use crate::world::tilemap::WallSpatialIndex;
 
 pub struct TargetingPlugin;
 
@@ -142,15 +143,39 @@ fn spawn_target_ui(mut commands: Commands) {
 fn update_hover(
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     camera_query: Option<Single<(&Camera, &GlobalTransform), With<MainCamera>>>,
+    player_tf: Option<Single<&Transform, With<Player>>>,
     pause_menu: Option<Res<PauseMenuState>>,
-    targetables: Query<(Entity, &GlobalTransform, &Targetable)>,
+    wall_index: Res<WallSpatialIndex>,
+    targetables: Query<(Entity, &GlobalTransform, &Targetable, &Visibility)>,
     mut state: ResMut<TargetState>,
 ) {
-    // Clear dead targets
-    if let Some(targeted) = state.targeted
-        && targetables.get(targeted).is_err()
-    {
+    let Some(player_tf) = player_tf else {
+        state.hovered = None;
         state.targeted = None;
+        return;
+    };
+
+    // Clear targets that are no longer valid or visible
+    if let Some(targeted) = state.targeted {
+        let target_visible = targetables.get(targeted).ok().is_some_and(
+            |(_, global_tf, _, visibility): (
+                Entity,
+                &GlobalTransform,
+                &Targetable,
+                &Visibility,
+            )| {
+                *visibility != Visibility::Hidden
+                    && target_visible_from_player(
+                        player_tf.translation,
+                        global_tf.translation(),
+                        &wall_index,
+                    )
+            },
+        );
+
+        if !target_visible {
+            state.targeted = None;
+        }
     }
 
     state.hovered = None;
@@ -180,7 +205,18 @@ fn update_hover(
 
     let mut best: Option<(Entity, f32)> = None;
 
-    for (entity, global_tf, targetable) in &targetables {
+    for (entity, global_tf, targetable, visibility) in &targetables {
+        let global_tf: &GlobalTransform = global_tf;
+        if *visibility == Visibility::Hidden
+            || !target_visible_from_player(
+                player_tf.translation,
+                global_tf.translation(),
+                &wall_index,
+            )
+        {
+            continue;
+        }
+
         let center = global_tf.translation() + Vec3::Y * 0.4;
         let to_center = center - ray.origin;
         let t = to_center.dot(*ray.direction);
@@ -205,6 +241,18 @@ fn update_hover(
     }
 
     state.hovered = best.map(|(e, _)| e);
+}
+
+fn target_visible_from_player(
+    player_translation: Vec3,
+    target_translation: Vec3,
+    wall_index: &WallSpatialIndex,
+) -> bool {
+    wall_index.segment_clear(
+        Vec2::new(player_translation.x, player_translation.z),
+        Vec2::new(target_translation.x, target_translation.z),
+        0.0,
+    )
 }
 
 fn update_highlight_glow(
@@ -272,10 +320,10 @@ fn set_emissive_recursive(
 ) {
     let mut stack = vec![entity];
     while let Some(current) = stack.pop() {
-        if let Ok(mat_handle) = material_query.get(current)
-            && let Some(mat) = materials.get_mut(&mat_handle.0)
-        {
-            mat.emissive = emissive;
+        if let Ok(mat_handle) = material_query.get(current) {
+            if let Some(mat) = materials.get_mut(&mat_handle.0) {
+                mat.emissive = emissive;
+            }
         }
         if let Ok(children) = children_query.get(current) {
             for &child in children.iter() {
@@ -287,7 +335,10 @@ fn set_emissive_recursive(
 
 fn update_target_ui(
     state: Res<TargetState>,
-    targetables: Query<(&Targetable, &HitPoints, &StunMeter)>,
+    targetables: Query<
+        (&Targetable, &HitPoints, &StunMeter, &Visibility),
+        (With<Targetable>, Without<TargetPanel>),
+    >,
     mut panel_vis: Single<&mut Visibility, With<TargetPanel>>,
     mut text: Single<&mut Text, With<TargetNameText>>,
     mut hp_fill: Single<&mut Node, (With<TargetHpFill>, Without<TargetStunFill>)>,
@@ -296,11 +347,15 @@ fn update_target_ui(
     let display_entity = state.hovered.or(state.targeted);
 
     let show = if let Some(entity) = display_entity {
-        if let Ok((targetable, hp, stun)) = targetables.get(entity) {
-            text.0 = targetable.name.clone();
-            hp_fill.width = Val::Percent(hp.fraction().clamp(0.0, 1.0) * 100.0);
-            stun_fill.width = Val::Percent((1.0 - stun.fraction()).clamp(0.0, 1.0) * 100.0);
-            true
+        if let Ok((targetable, hp, stun, visibility)) = targetables.get(entity) {
+            if *visibility == Visibility::Hidden {
+                false
+            } else {
+                text.0 = targetable.name.clone();
+                hp_fill.width = Val::Percent(hp.fraction().clamp(0.0, 1.0) * 100.0);
+                stun_fill.width = Val::Percent((1.0 - stun.fraction()).clamp(0.0, 1.0) * 100.0);
+                true
+            }
         } else {
             false
         }
@@ -313,4 +368,40 @@ fn update_target_ui(
     } else {
         Visibility::Hidden
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::tilemap::{WallSegment, WallSpatialIndex};
+
+    #[test]
+    fn target_visibility_rejects_blocked_targets() {
+        let mut wall_index = WallSpatialIndex::default();
+        wall_index.rebuild(vec![WallSegment {
+            center: Vec2::new(5.0, 0.0),
+            half_extents: Vec2::new(1.0, 1.0),
+        }]);
+
+        assert!(!target_visible_from_player(
+            Vec3::ZERO,
+            Vec3::new(10.0, 0.0, 0.0),
+            &wall_index,
+        ));
+    }
+
+    #[test]
+    fn target_visibility_allows_clear_targets() {
+        let mut wall_index = WallSpatialIndex::default();
+        wall_index.rebuild(vec![WallSegment {
+            center: Vec2::new(5.0, 3.0),
+            half_extents: Vec2::new(1.0, 1.0),
+        }]);
+
+        assert!(target_visible_from_player(
+            Vec3::ZERO,
+            Vec3::new(10.0, 0.0, 0.0),
+            &wall_index,
+        ));
+    }
 }

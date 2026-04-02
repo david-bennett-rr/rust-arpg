@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 use crate::hud::PauseMenuState;
+use crate::rng::SplitMix64;
 
 #[derive(Resource, Default)]
 pub struct GameOver(pub bool);
@@ -41,6 +42,10 @@ impl HitPoints {
 
     pub fn is_dead(&self) -> bool {
         self.current <= 0
+    }
+
+    pub fn heal_to_full(&mut self) {
+        self.current = self.max;
     }
 
     pub fn fraction(&self) -> f32 {
@@ -96,6 +101,7 @@ impl StunMeter {
 pub struct HitFlash {
     timer: Timer,
     active: bool,
+    dirty: bool,
 }
 
 impl Default for HitFlash {
@@ -103,6 +109,7 @@ impl Default for HitFlash {
         Self {
             timer: Timer::from_seconds(0.12, TimerMode::Once),
             active: false,
+            dirty: false,
         }
     }
 }
@@ -111,6 +118,7 @@ impl HitFlash {
     pub fn trigger(&mut self) {
         self.timer.reset();
         self.active = true;
+        self.dirty = true;
     }
 
     pub fn amount(&self) -> f32 {
@@ -131,7 +139,13 @@ pub struct FlashTint {
 
 fn tick_hit_flashes(time: Res<Time>, mut flashes: Query<&mut HitFlash>) {
     for mut flash in &mut flashes {
+        if !flash.dirty {
+            continue;
+        }
+
         if !flash.active {
+            // Base color was restored last frame; stop processing.
+            flash.dirty = false;
             continue;
         }
 
@@ -164,7 +178,13 @@ fn update_hit_flash_tints(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (tint, material_handle) in &tint_targets {
-        let amount = flashes.get(tint.owner).map(HitFlash::amount).unwrap_or(0.0);
+        let Ok(flash) = flashes.get(tint.owner) else {
+            continue;
+        };
+        if !flash.dirty {
+            continue;
+        }
+        let amount = flash.amount();
         let Some(material) = materials.get_mut(&material_handle.0) else {
             continue;
         };
@@ -180,28 +200,41 @@ fn flash_color(base_srgb: Vec3, amount: f32) -> Color {
 }
 
 #[derive(Resource, Default)]
-pub struct DamageRng(pub u64);
+pub struct DamageRng(SplitMix64);
 
 impl DamageRng {
     pub fn roll_1d5(&mut self) -> i32 {
-        if self.0 == 0 {
-            self.0 = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xA2F1_9C37_5D4B_E821);
-        }
-
-        // SplitMix64 — well-tested, high-quality PRNG
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z = z ^ (z >> 31);
-        ((z % 5) + 1) as i32
+        self.0.next_usize(5) as i32 + 1
     }
 }
 
 pub fn smoothstep01(t: f32) -> f32 {
     let x = t.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn damage_rng_rolls_stay_in_range() {
+        let mut rng = DamageRng(SplitMix64::new(123));
+
+        for _ in 0..32 {
+            assert!((1..=5).contains(&rng.roll_1d5()));
+        }
+    }
+
+    #[test]
+    fn hit_points_damage_clamps_to_remaining_health() {
+        let mut hp = HitPoints {
+            current: 3,
+            max: 10,
+        };
+
+        assert_eq!(hp.apply_damage(8), 3);
+        assert_eq!(hp.current, 0);
+        assert!(hp.is_dead());
+    }
 }

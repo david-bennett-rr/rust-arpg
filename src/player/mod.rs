@@ -91,8 +91,6 @@ impl Default for Dodge {
 pub struct PlayerStats {
     pub stamina: f32,
     pub max_stamina: f32,
-    pub mana: f32,
-    pub max_mana: f32,
     regen_delay: Timer,
 }
 
@@ -103,8 +101,6 @@ impl Default for PlayerStats {
         Self {
             stamina: MAX_STAMINA,
             max_stamina: MAX_STAMINA,
-            mana: MAX_MANA,
-            max_mana: MAX_MANA,
             regen_delay: delay,
         }
     }
@@ -198,7 +194,6 @@ const DODGE_COOLDOWN: f32 = 0.8;
 const DODGE_DISTANCE: f32 = 6.4;
 
 const MAX_STAMINA: f32 = 60.0;
-const MAX_MANA: f32 = 40.0;
 const STAMINA_REGEN: f32 = 18.0;
 const STAMINA_REGEN_DELAY: f32 = 0.6;
 const ATTACK_STAMINA_COST: f32 = 22.0;

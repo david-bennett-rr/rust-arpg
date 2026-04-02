@@ -8,7 +8,7 @@ use crate::player::{
     PlayerStats,
 };
 use crate::targeting::TargetState;
-use crate::world::tilemap::{PLAYER_SPAWN_GRID, grid_to_world};
+use crate::world::floor::FloorMap;
 
 const BAR_WIDTH: f32 = 220.0;
 const BAR_HEIGHT: f32 = 14.0;
@@ -20,8 +20,6 @@ const HP_COLOR: Color = Color::srgb(0.7, 0.12, 0.12);
 const HP_BG: Color = Color::srgb(0.18, 0.04, 0.04);
 const STAMINA_COLOR: Color = Color::srgb(0.22, 0.6, 0.18);
 const STAMINA_BG: Color = Color::srgb(0.06, 0.14, 0.05);
-const MANA_COLOR: Color = Color::srgb(0.15, 0.25, 0.7);
-const MANA_BG: Color = Color::srgb(0.04, 0.06, 0.18);
 
 pub struct HudPlugin;
 
@@ -60,6 +58,7 @@ impl Plugin for HudPlugin {
 enum PauseMenuAction {
     Resume,
     RestartLevel,
+    Quit,
 }
 
 #[derive(Resource)]
@@ -98,15 +97,17 @@ impl PauseMenuState {
 
     fn select_previous(&mut self) {
         self.selected = match self.selected {
-            PauseMenuAction::Resume => PauseMenuAction::RestartLevel,
+            PauseMenuAction::Resume => PauseMenuAction::Quit,
             PauseMenuAction::RestartLevel => PauseMenuAction::Resume,
+            PauseMenuAction::Quit => PauseMenuAction::RestartLevel,
         };
     }
 
     fn select_next(&mut self) {
         self.selected = match self.selected {
             PauseMenuAction::Resume => PauseMenuAction::RestartLevel,
-            PauseMenuAction::RestartLevel => PauseMenuAction::Resume,
+            PauseMenuAction::RestartLevel => PauseMenuAction::Quit,
+            PauseMenuAction::Quit => PauseMenuAction::Resume,
         };
     }
 }
@@ -122,7 +123,6 @@ struct HudBarFill(BarKind);
 enum BarKind {
     Health,
     Stamina,
-    Mana,
 }
 
 fn spawn_hud(mut commands: Commands) {
@@ -138,7 +138,6 @@ fn spawn_hud(mut commands: Commands) {
         .with_children(|parent| {
             spawn_bar(parent, BarKind::Health, HP_COLOR, HP_BG);
             spawn_bar(parent, BarKind::Stamina, STAMINA_COLOR, STAMINA_BG);
-            spawn_bar(parent, BarKind::Mana, MANA_COLOR, MANA_BG);
         });
 }
 
@@ -176,7 +175,6 @@ fn update_hud(
         let pct = match bar.0 {
             BarKind::Health => hp.fraction(),
             BarKind::Stamina => stats.stamina / stats.max_stamina,
-            BarKind::Mana => stats.mana / stats.max_mana,
         };
         node.width = Val::Percent(pct.clamp(0.0, 1.0) * 100.0);
     }
@@ -245,6 +243,8 @@ struct RestartContext<'w, 's> {
     player: RestartPlayer<'w>,
     target_state: ResMut<'w, TargetState>,
     respawn_event: EventWriter<'w, RespawnEnemies>,
+    exit_event: EventWriter<'w, AppExit>,
+    floor_map: Option<Res<'w, FloorMap>>,
 }
 
 impl RestartContext<'_, '_> {
@@ -252,6 +252,9 @@ impl RestartContext<'_, '_> {
         match action {
             PauseMenuAction::Resume => self.resume(),
             PauseMenuAction::RestartLevel => self.restart_level(),
+            PauseMenuAction::Quit => {
+                self.exit_event.send(AppExit::Success);
+            }
         }
     }
 
@@ -286,9 +289,13 @@ impl RestartContext<'_, '_> {
                 ref mut animator,
                 ref mut flash,
             ) = **player;
-            transform.translation = grid_to_world(PLAYER_SPAWN_GRID.0, PLAYER_SPAWN_GRID.1);
+            transform.translation = self
+                .floor_map
+                .as_ref()
+                .map(|fm| fm.rooms[fm.start_room].world_center)
+                .unwrap_or(Vec3::ZERO);
             transform.rotation = Quat::IDENTITY;
-            hit_points.current = hit_points.max;
+            hit_points.heal_to_full();
             **stats = PlayerStats::default();
             **combat = PlayerCombat::default();
             **dodge = Dodge::default();
@@ -355,6 +362,7 @@ fn spawn_pause_menu(mut commands: Commands) {
 
                     spawn_pause_button(panel, PauseMenuAction::Resume, "RESUME");
                     spawn_pause_button(panel, PauseMenuAction::RestartLevel, "RESTART LEVEL");
+                    spawn_pause_button(panel, PauseMenuAction::Quit, "QUIT");
                 });
         });
 }
