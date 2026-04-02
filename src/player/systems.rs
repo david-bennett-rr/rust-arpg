@@ -10,8 +10,9 @@ use crate::world::tilemap::{
 };
 
 use super::{
-    dodge_motion_curve, visual_forward, ControllerMove, Dodge, KnightAnimator, MoveTarget, Player,
-    PlayerCombat, PlayerStats, ARRIVE_THRESHOLD, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP,
+    dodge_motion_curve, visual_forward, AttackLunge, ControllerMove, Dodge, KnightAnimator,
+    MoveTarget, Player, PlayerCombat, PlayerStats, ARRIVE_THRESHOLD, ATTACK_LUNGE_DURATION,
+    ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE, ATTACK_STAMINA_COST, ATTACK_WINDUP,
     DODGE_DISTANCE, DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
 };
 
@@ -38,6 +39,7 @@ type AttackPlayer<'w> = Single<
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
         &'static mut PlayerStats,
+        &'static mut AttackLunge,
     ),
     With<Player>,
 >;
@@ -284,9 +286,12 @@ pub(super) fn chase_and_attack_target(
         ref mut animator,
         ref mut combat,
         ref mut stats,
+        ref mut attack_lunge,
     ) = *player;
 
     // Resolve target: face it, chase it if needed
+    let mut lunge_target: Option<Vec3> = None;
+
     let has_target = if let Some(target_entity) = controls.target_state.targeted {
         if let Ok((target_tf, visibility)) = target_transforms.get(target_entity) {
             if *visibility == Visibility::Hidden {
@@ -313,8 +318,13 @@ pub(super) fn chase_and_attack_target(
                 }
 
                 let can_attack = attack_intent.pending_strike || attack_intent.holding;
+                let in_lunge_range = clear_path && distance <= ATTACK_LUNGE_RANGE;
 
-                // Chase toward target if out of range
+                if in_lunge_range {
+                    lunge_target = Some(target_pos);
+                }
+
+                // Chase toward target if out of melee range
                 if can_attack && clear_path && distance > ATTACK_RANGE && !controller_move.active()
                 {
                     move_target.position = Some(clamp_ground_target(
@@ -322,7 +332,7 @@ pub(super) fn chase_and_attack_target(
                         Vec2::new(target_pos.x, target_pos.z),
                         PLAYER_COLLISION_RADIUS,
                     ));
-                    if distance > ATTACK_RANGE * 1.5 {
+                    if !in_lunge_range {
                         attack_intent.windup = 0.0;
                     }
                 } else {
@@ -332,7 +342,7 @@ pub(super) fn chase_and_attack_target(
                     }
                 }
 
-                clear_path && distance <= ATTACK_RANGE
+                in_lunge_range
             }
         } else {
             true // target entity exists but transform gone — allow swing anyway
@@ -350,10 +360,62 @@ pub(super) fn chase_and_attack_target(
         controls.time.delta_secs(),
     ) && stats.spend_stamina(ATTACK_STAMINA_COST)
     {
+        // Gap-close lunge toward target when swing fires
+        if let Some(target_pos) = lunge_target {
+            move_target.position = None;
+            let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+            let to_target = Vec2::new(target_pos.x, target_pos.z) - current;
+            let distance = to_target.length();
+            if distance > ATTACK_LUNGE_STOP {
+                let lunge_dist = distance - ATTACK_LUNGE_STOP;
+                let direction = to_target / distance;
+                attack_lunge.start = current;
+                attack_lunge.end = current + direction * lunge_dist;
+                attack_lunge.timer = Timer::from_seconds(ATTACK_LUNGE_DURATION, TimerMode::Once);
+            }
+        }
+
         animator.swing_timer.reset();
         combat.swing_id = combat.swing_id.wrapping_add(1);
         combat.strike = 0.0;
     }
+}
+
+pub(super) fn update_attack_lunge(
+    time: Res<Time>,
+    bounds: Res<FloorBounds>,
+    walls: PlayerWallQuery<'_, '_>,
+    mut player: Single<(&mut Transform, &mut AttackLunge), With<Player>>,
+) {
+    let (ref mut player_tf, ref mut lunge) = *player;
+    if !lunge.active() {
+        return;
+    }
+
+    let prev_progress = lunge.progress();
+    lunge.timer.tick(time.delta());
+    let progress = lunge.progress();
+
+    // Cubic ease-out for a snappy start that decelerates
+    let prev_t = 1.0 - (1.0 - prev_progress).powi(3);
+    let curr_t = 1.0 - (1.0 - progress).powi(3);
+    let step_frac = curr_t - prev_t;
+
+    let total_delta = lunge.end - lunge.start;
+    let step = total_delta * step_frac;
+
+    let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+    let desired = current + step;
+    let swept = sweep_ground_target(
+        &bounds,
+        current,
+        desired,
+        PLAYER_COLLISION_RADIUS,
+        walls.iter(),
+        PLAYER_WALL_CLEARANCE,
+    );
+    player_tf.translation.x = swept.x;
+    player_tf.translation.z = swept.y;
 }
 
 pub(super) fn trigger_dodge(

@@ -63,6 +63,13 @@ struct TargetStunFill;
 #[derive(Component)]
 struct TargetPanel;
 
+type TargetableQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Targetable, &'static HitPoints, &'static StunMeter, &'static Visibility),
+    (With<Targetable>, Without<TargetPanel>),
+>;
+
 const TARGET_BAR_WIDTH: f32 = 180.0;
 const TARGET_BAR_HEIGHT: f32 = 10.0;
 
@@ -335,10 +342,7 @@ fn set_emissive_recursive(
 
 fn update_target_ui(
     state: Res<TargetState>,
-    targetables: Query<
-        (&Targetable, &HitPoints, &StunMeter, &Visibility),
-        (With<Targetable>, Without<TargetPanel>),
-    >,
+    targetables: TargetableQuery<'_, '_>,
     mut panel_vis: Single<&mut Visibility, With<TargetPanel>>,
     mut text: Single<&mut Text, With<TargetNameText>>,
     mut hp_fill: Single<&mut Node, (With<TargetHpFill>, Without<TargetStunFill>)>,

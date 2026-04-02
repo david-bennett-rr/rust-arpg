@@ -24,6 +24,7 @@ impl Plugin for PlayerPlugin {
                     systems::handle_left_click,
                     systems::handle_controller_targeting,
                     systems::chase_and_attack_target,
+                    systems::update_attack_lunge,
                     systems::trigger_dodge,
                     systems::update_dodge,
                     systems::regen_stamina,
@@ -118,6 +119,36 @@ impl PlayerStats {
     }
 }
 
+#[derive(Component)]
+pub struct AttackLunge {
+    pub(super) start: Vec2,
+    pub(super) end: Vec2,
+    pub(super) timer: Timer,
+}
+
+impl Default for AttackLunge {
+    fn default() -> Self {
+        let mut timer = Timer::from_seconds(ATTACK_LUNGE_DURATION, TimerMode::Once);
+        timer.tick(std::time::Duration::from_secs_f32(ATTACK_LUNGE_DURATION));
+        Self {
+            start: Vec2::ZERO,
+            end: Vec2::ZERO,
+            timer,
+        }
+    }
+}
+
+impl AttackLunge {
+    pub fn active(&self) -> bool {
+        !self.timer.finished()
+    }
+
+    pub fn progress(&self) -> f32 {
+        let duration = self.timer.duration().as_secs_f32().max(0.001);
+        (self.timer.elapsed_secs() / duration).clamp(0.0, 1.0)
+    }
+}
+
 const DEATH_ANIM_DURATION: f32 = 1.2;
 
 #[derive(Component)]
@@ -188,6 +219,9 @@ const MOVE_SPEED: f32 = 8.0;
 const ARRIVE_THRESHOLD: f32 = 0.15;
 pub const PLAYER_MAX_HP: i32 = 20;
 const ATTACK_RANGE: f32 = 2.3;
+const ATTACK_LUNGE_RANGE: f32 = 3.5;
+const ATTACK_LUNGE_STOP: f32 = 1.6;
+const ATTACK_LUNGE_DURATION: f32 = 0.12;
 const ATTACK_WINDUP: f32 = 0.14;
 const DODGE_DURATION: f32 = 0.38;
 const DODGE_COOLDOWN: f32 = 0.8;

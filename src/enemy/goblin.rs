@@ -254,7 +254,7 @@ pub(super) fn do_spawn_goblins(
                 },
                 HighlightGlow::default(),
                 HitPoints::new(GOBLIN_HP),
-                StunMeter::new(3.0, 3.0, 1.2),
+                StunMeter::new(3.0, 3.0, 0.4),
                 HitFlash::default(),
                 FogDynamic::default(),
                 UniqueEnemyMaterials,

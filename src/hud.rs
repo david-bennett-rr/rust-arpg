@@ -4,8 +4,8 @@ use bevy::{input::gamepad::Gamepad, prelude::*};
 use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
 use crate::player::{
-    ControllerMove, DeathAnim, Dodge, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerSet,
-    PlayerStats,
+    AttackLunge, ControllerMove, DeathAnim, Dodge, KnightAnimator, MoveTarget, Player,
+    PlayerCombat, PlayerSet, PlayerStats,
 };
 use crate::targeting::TargetState;
 use crate::world::floor::FloorMap;
@@ -223,6 +223,7 @@ type RestartPlayer<'w> = Option<
             &'static mut HitPoints,
             &'static mut PlayerStats,
             &'static mut PlayerCombat,
+            &'static mut AttackLunge,
             &'static mut Dodge,
             &'static mut MoveTarget,
             &'static mut ControllerMove,
@@ -282,6 +283,7 @@ impl RestartContext<'_, '_> {
                 ref mut hit_points,
                 ref mut stats,
                 ref mut combat,
+                ref mut attack_lunge,
                 ref mut dodge,
                 ref mut move_target,
                 ref mut controller_move,
@@ -298,6 +300,7 @@ impl RestartContext<'_, '_> {
             hit_points.heal_to_full();
             **stats = PlayerStats::default();
             **combat = PlayerCombat::default();
+            **attack_lunge = AttackLunge::default();
             **dodge = Dodge::default();
             **controller_move = ControllerMove::default();
             **death_anim = DeathAnim::default();
@@ -506,16 +509,17 @@ fn navigate_pause_menu(
         keyboard.just_pressed(KeyCode::ArrowDown) || keyboard.just_pressed(KeyCode::KeyS);
 
     let stick_y = gamepads.iter().fold(0.0_f32, |best, gamepad| {
-        let candidate = gamepad.dpad().y;
-        if candidate.abs() >= best.abs() {
+        let dpad = gamepad.dpad().y;
+        let stick = gamepad.left_stick().y;
+        let candidate = if dpad.abs() >= stick.abs() {
+            dpad
+        } else {
+            stick
+        };
+        if candidate.abs() > best.abs() {
             candidate
         } else {
-            let stick = gamepad.left_stick().y;
-            if stick.abs() >= best.abs() {
-                stick
-            } else {
-                best
-            }
+            best
         }
     });
     let stick_active = stick_y.abs() >= 0.5;

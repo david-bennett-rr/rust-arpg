@@ -192,7 +192,7 @@ pub(super) fn do_spawn_rats(
                 },
                 HighlightGlow::default(),
                 HitPoints::new(RAT_HP),
-                StunMeter::new(4.0, 2.5, 1.5),
+                StunMeter::new(4.0, 2.5, 0.5),
                 HitFlash::default(),
                 FogDynamic::default(),
                 UniqueEnemyMaterials,

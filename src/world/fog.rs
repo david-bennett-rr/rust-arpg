@@ -1,8 +1,7 @@
-use smallvec::SmallVec;
-
 use bevy::{
     asset::Asset,
     color::Alpha,
+    ecs::system::SystemParam,
     image::ImageSampler,
     pbr::Material,
     prelude::*,
@@ -13,11 +12,12 @@ use bevy::{
     },
 };
 
+use crate::combat::smoothstep01;
 use crate::enemy::UniqueEnemyMaterials;
 use crate::player::Player;
 use crate::targeting::TargetState;
 
-use super::tilemap::{WallSpatialIndex, TILE_SIZE};
+use super::tilemap::WallSpatialIndex;
 
 const FOG_REVEAL_RADIUS: f32 = 13.0;
 const FOG_REVEAL_RADIUS_SQ: f32 = FOG_REVEAL_RADIUS * FOG_REVEAL_RADIUS;
@@ -64,22 +64,15 @@ impl FogMaterialSet {
 }
 
 #[derive(Component, Clone)]
-pub(crate) struct FogStatic {
-    #[allow(dead_code)]
-    samples: SmallVec<[Vec2; 5]>,
-}
+pub(crate) struct FogStatic;
 
 impl FogStatic {
-    pub(crate) fn point(sample: Vec2, _materials: FogMaterialSet) -> Self {
-        Self {
-            samples: point_samples(sample),
-        }
+    pub(crate) fn point(_sample: Vec2, _materials: FogMaterialSet) -> Self {
+        Self
     }
 
-    pub(crate) fn edge(sample_a: Vec2, sample_b: Vec2, _materials: FogMaterialSet) -> Self {
-        Self {
-            samples: edge_samples(sample_a, sample_b),
-        }
+    pub(crate) fn edge(_sample_a: Vec2, _sample_b: Vec2, _materials: FogMaterialSet) -> Self {
+        Self
     }
 }
 
@@ -398,40 +391,48 @@ pub(crate) fn update_static_fog(
     }
 }
 
-pub(crate) fn update_dynamic_fog(
-    player: Option<Single<&Transform, With<Player>>>,
-    time: Res<Time>,
-    fog_runtime: Res<FogRuntimeState>,
-    wall_index: Res<WallSpatialIndex>,
-    mut target_state: Option<ResMut<TargetState>>,
-    children_query: Query<&Children>,
-    material_handles: Query<&MeshMaterial3d<StandardMaterial>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut fogged: Query<
-        (
-            Entity,
-            &GlobalTransform,
-            &mut Visibility,
-            &mut FogDynamic,
-            Has<UniqueEnemyMaterials>,
-        ),
-        With<FogDynamic>,
-    >,
-) {
-    let Some(player) = player else {
+pub(crate) type FoggedQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static mut Visibility,
+        &'static mut FogDynamic,
+        Has<UniqueEnemyMaterials>,
+    ),
+    With<FogDynamic>,
+>;
+
+#[derive(SystemParam)]
+pub(crate) struct DynamicFogContext<'w, 's> {
+    player: Option<Single<'w, &'static Transform, With<Player>>>,
+    time: Res<'w, Time>,
+    fog_runtime: Res<'w, FogRuntimeState>,
+    wall_index: Res<'w, WallSpatialIndex>,
+    target_state: Option<ResMut<'w, TargetState>>,
+    children_query: Query<'w, 's, &'static Children>,
+    material_handles: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    fogged: FoggedQuery<'w, 's>,
+}
+
+pub(crate) fn update_dynamic_fog(mut ctx: DynamicFogContext<'_, '_>) {
+    let Some(player) = ctx.player else {
         return;
     };
     let player_ground = horizontal(player.translation);
-    let visibility_origin = fog_runtime.visible_window_center.unwrap_or(player_ground);
-    let fade_blend = response_blend(FOG_DYNAMIC_FADE_SPEED, time.delta_secs()).clamp(0.0, 1.0);
+    let visibility_origin = ctx.fog_runtime.visible_window_center.unwrap_or(player_ground);
+    let fade_blend =
+        response_blend(FOG_DYNAMIC_FADE_SPEED, ctx.time.delta_secs()).clamp(0.0, 1.0);
 
     for (entity, global_transform, mut visibility, mut fog_dynamic, has_unique_materials) in
-        &mut fogged
+        &mut ctx.fogged
     {
         let target_visible = sample_visible(
             visibility_origin,
             horizontal(global_transform.translation()),
-            &wall_index,
+            &ctx.wall_index,
         );
         if has_unique_materials {
             let target_alpha = if target_visible { 1.0 } else { 0.0 };
@@ -444,9 +445,9 @@ pub(crate) fn update_dynamic_fog(
             apply_fog_alpha_to_entity(
                 entity,
                 display_alpha,
-                &children_query,
-                &material_handles,
-                &mut materials,
+                &ctx.children_query,
+                &ctx.material_handles,
+                &mut ctx.materials,
             );
             if !target_visible && display_alpha <= FOG_DYNAMIC_HIDDEN_ALPHA {
                 *visibility = Visibility::Hidden;
@@ -459,7 +460,7 @@ pub(crate) fn update_dynamic_fog(
             };
         }
 
-        let Some(target_state) = target_state.as_mut() else {
+        let Some(target_state) = ctx.target_state.as_mut() else {
             continue;
         };
         if !target_visible && target_state.hovered == Some(entity) {
@@ -558,7 +559,7 @@ fn world_to_pixel(world_min: Vec2, world_size: Vec2, size: UVec2, world: Vec2) -
 
 fn response_blend(speed: f32, delta_secs: f32) -> f32 {
     if speed <= 0.0 || delta_secs <= 0.0 {
-        return 1.0;
+        return 0.0;
     }
     1.0 - (-speed * delta_secs).exp()
 }
@@ -687,34 +688,8 @@ fn sample_visibility_strength(
     smoothstep01(((FOG_REVEAL_RADIUS - distance) / FOG_VISIBLE_EDGE_SOFTNESS).clamp(0.0, 1.0))
 }
 
-fn point_samples(center: Vec2) -> SmallVec<[Vec2; 5]> {
-    let offset = TILE_SIZE * 0.32;
-    smallvec::smallvec![
-        center,
-        center + Vec2::X * offset,
-        center - Vec2::X * offset,
-        center + Vec2::Y * offset,
-        center - Vec2::Y * offset,
-    ]
-}
-
-fn edge_samples(start: Vec2, end: Vec2) -> SmallVec<[Vec2; 5]> {
-    smallvec::smallvec![
-        start.lerp(end, 0.0),
-        start.lerp(end, 0.25),
-        start.lerp(end, 0.5),
-        start.lerp(end, 0.75),
-        start.lerp(end, 1.0),
-    ]
-}
-
 fn horizontal(point: Vec3) -> Vec2 {
     Vec2::new(point.x, point.z)
-}
-
-fn smoothstep01(t: f32) -> f32 {
-    let x = t.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
 }
 
 #[cfg(test)]
