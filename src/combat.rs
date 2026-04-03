@@ -1,14 +1,20 @@
 use bevy::prelude::*;
 use smallvec::SmallVec;
 
-use crate::hud::PauseMenuState;
+use crate::hud::{PauseMenuState, RestTransitionState};
 use crate::rng::SplitMix64;
 
 #[derive(Resource, Default)]
 pub struct GameOver(pub bool);
 
-pub fn game_running(game_over: Res<GameOver>, pause_menu: Option<Res<PauseMenuState>>) -> bool {
-    !game_over.0 && pause_menu.is_none_or(|pause_menu| !pause_menu.open)
+pub fn game_running(
+    game_over: Res<GameOver>,
+    pause_menu: Option<Res<PauseMenuState>>,
+    rest_transition: Option<Res<RestTransitionState>>,
+) -> bool {
+    !game_over.0
+        && pause_menu.is_none_or(|pause_menu| !pause_menu.open)
+        && rest_transition.is_none_or(|transition| !transition.active())
 }
 
 pub struct CombatPlugin;

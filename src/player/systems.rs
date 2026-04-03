@@ -1,23 +1,25 @@
 use bevy::ecs::system::SystemParam;
+use std::f32::consts::PI;
+
 use bevy::window::PrimaryWindow;
 use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::camera::MainCamera;
 use crate::combat::HitPoints;
-use crate::enemy::RespawnEnemies;
-use crate::hud::StaminaFlashEvent;
-use crate::world::Bonfire;
+use crate::hud::{BonfireRestEvent, StaminaFlashEvent};
 use crate::targeting::{TargetState, Targetable};
 use crate::world::tilemap::{
     clamp_ground_target, segment_clear_with_index, sweep_ground_target_indexed, FloorBounds,
     WallSpatialIndex,
 };
+use crate::world::Bonfire;
 
 use super::{
     dodge_motion_curve, visual_forward, AttackKind, AttackLunge, ControllerMove, Dodge,
-    HealingFlask, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats, ARRIVE_THRESHOLD,
-    ATTACK_LUNGE_DURATION, ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE, DODGE_DISTANCE,
-    DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS,
+    HealingFlask, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats, RunState,
+    ARRIVE_THRESHOLD, ATTACK_LUNGE_DURATION, ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE,
+    DODGE_DISTANCE, DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS, RUN_SPEED_MULTIPLIER,
+    RUN_STAMINA_DRAIN,
 };
 
 type DodgePlayer<'w> = Single<
@@ -275,9 +277,9 @@ pub(super) fn chase_and_attack_target(
         || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger);
 
     // Heavy attack: right-click (with target) or RT
-    let heavy_pressed =
-        (has_target_lock && controls.mouse_buttons.just_pressed(MouseButton::Right))
-            || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger2);
+    let heavy_pressed = (has_target_lock
+        && controls.mouse_buttons.just_pressed(MouseButton::Right))
+        || any_gamepad_just_pressed(&controls.gamepads, GamepadButton::RightTrigger2);
     let heavy_held = (has_target_lock && controls.mouse_buttons.pressed(MouseButton::Right))
         || any_gamepad_pressed(&controls.gamepads, GamepadButton::RightTrigger2);
 
@@ -397,8 +399,7 @@ pub(super) fn chase_and_attack_target(
             }
         }
 
-        animator.swing_timer =
-            Timer::from_seconds(kind.swing_duration(), TimerMode::Once);
+        animator.swing_timer = Timer::from_seconds(kind.swing_duration(), TimerMode::Once);
         combat.swing_id = combat.swing_id.wrapping_add(1);
         combat.strike = 0.0;
         combat.attack_kind = kind;
@@ -577,18 +578,12 @@ pub(super) fn use_healing_flask(
 pub(super) fn rest_at_bonfire(
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
-    mut player: Single<
-        (
-            &Transform,
-            &mut HitPoints,
-            &mut PlayerStats,
-            &mut HealingFlask,
-        ),
-        With<Player>,
-    >,
+    player: Single<&Transform, With<Player>>,
     mut bonfires: Query<(&Transform, &mut Bonfire), Without<Player>>,
+    bounds: Res<FloorBounds>,
+    wall_index: Res<WallSpatialIndex>,
     mut last_bonfire: ResMut<crate::hud::LastBonfirePosition>,
-    mut respawn: EventWriter<RespawnEnemies>,
+    mut rest_event: EventWriter<BonfireRestEvent>,
 ) {
     let pressed = keyboard.just_pressed(KeyCode::KeyE)
         || any_gamepad_just_pressed(&gamepads, GamepadButton::West);
@@ -597,8 +592,7 @@ pub(super) fn rest_at_bonfire(
         return;
     }
 
-    let (player_tf, ref mut hp, ref mut stats, ref mut flask) = *player;
-    let player_ground = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+    let player_ground = Vec2::new(player.translation.x, player.translation.z);
 
     let mut found = None;
     for (bonfire_tf, bonfire) in &mut bonfires {
@@ -621,11 +615,74 @@ pub(super) fn rest_at_bonfire(
         return;
     }
 
-    // Rest: refill everything, respawn enemies
-    hp.heal_to_full();
-    stats.stamina = stats.max_stamina;
-    **flask = HealingFlask::default();
-    respawn.send(RespawnEnemies);
+    let bonfire_ground = Vec2::new(bonfire_pos.x, bonfire_pos.z);
+    let rest_ground = find_bonfire_rest_spot(player_ground, bonfire_ground, &bounds, &wall_index);
+    rest_event.send(BonfireRestEvent {
+        rest_position: Vec3::new(rest_ground.x, player.translation.y, rest_ground.y),
+        facing_rotation: player.rotation,
+    });
+}
+
+fn find_bonfire_rest_spot(
+    player_ground: Vec2,
+    bonfire_ground: Vec2,
+    bounds: &FloorBounds,
+    wall_index: &WallSpatialIndex,
+) -> Vec2 {
+    let mut base_dir = player_ground - bonfire_ground;
+    if base_dir.length_squared() <= 0.0001 {
+        base_dir = Vec2::NEG_Y;
+    }
+
+    let base_angle = base_dir.to_angle();
+    let distances = [3.05, 3.45, 2.75, 4.10];
+    let angle_offsets = [0.0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35, PI];
+
+    for distance in distances {
+        for angle_offset in angle_offsets {
+            let direction = Vec2::from_angle(base_angle + angle_offset);
+            let candidate = clamp_ground_target(
+                bounds,
+                bonfire_ground + direction * distance,
+                PLAYER_COLLISION_RADIUS,
+            );
+            if bonfire_rest_spot_clear(candidate, wall_index) {
+                return candidate;
+            }
+        }
+    }
+
+    clamp_ground_target(
+        bounds,
+        bonfire_ground + Vec2::from_angle(base_angle) * distances[0],
+        PLAYER_COLLISION_RADIUS,
+    )
+}
+
+fn bonfire_rest_spot_clear(point: Vec2, wall_index: &WallSpatialIndex) -> bool {
+    let radius = PLAYER_COLLISION_RADIUS + PLAYER_WALL_CLEARANCE;
+    let mut blocked = false;
+
+    wall_index.for_each_nearby_segment(point, radius, |segment| {
+        if blocked {
+            return;
+        }
+
+        let closest_x = point.x.clamp(
+            segment.center.x - segment.half_extents.x,
+            segment.center.x + segment.half_extents.x,
+        );
+        let closest_z = point.y.clamp(
+            segment.center.y - segment.half_extents.y,
+            segment.center.y + segment.half_extents.y,
+        );
+        let delta = point - Vec2::new(closest_x, closest_z);
+        if delta.length_squared() < radius * radius {
+            blocked = true;
+        }
+    });
+
+    !blocked
 }
 
 pub(super) fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats, With<Player>>) {
@@ -636,16 +693,50 @@ pub(super) fn regen_stamina(time: Res<Time>, mut player: Single<&mut PlayerStats
     }
 }
 
+pub(super) fn update_run_state(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut player: Single<
+        (
+            &ControllerMove,
+            &Dodge,
+            &AttackLunge,
+            &mut PlayerStats,
+            &mut RunState,
+        ),
+        With<Player>,
+    >,
+) {
+    let (controller_move, dodge, attack_lunge, ref mut stats, ref mut run_state) = *player;
+
+    let run_held =
+        keyboard.pressed(KeyCode::Space) || any_gamepad_pressed(&gamepads, GamepadButton::East);
+    let can_run = run_held && controller_move.active() && !dodge.active && !attack_lunge.active();
+
+    if can_run && stats.spend_stamina(RUN_STAMINA_DRAIN * time.delta_secs()) {
+        run_state.active = true;
+    } else {
+        run_state.active = false;
+    }
+}
+
 pub(super) fn move_player_with_controller(
     mut player_query: Single<
-        (&mut Transform, &mut MoveTarget, &ControllerMove, &Dodge),
+        (
+            &mut Transform,
+            &mut MoveTarget,
+            &ControllerMove,
+            &Dodge,
+            &RunState,
+        ),
         With<Player>,
     >,
     time: Res<Time>,
     bounds: Res<FloorBounds>,
     wall_index: Res<WallSpatialIndex>,
 ) {
-    let (ref mut player_tf, ref mut move_target, controller_move, dodge) = *player_query;
+    let (ref mut player_tf, ref mut move_target, controller_move, dodge, run_state) = *player_query;
 
     if dodge.active {
         return;
@@ -664,7 +755,12 @@ pub(super) fn move_player_with_controller(
         player_tf.look_to(-facing, Vec3::Y);
     }
 
-    let step = MOVE_SPEED * magnitude * time.delta_secs();
+    let speed = if run_state.active {
+        MOVE_SPEED * RUN_SPEED_MULTIPLIER
+    } else {
+        MOVE_SPEED
+    };
+    let step = speed * magnitude * time.delta_secs();
     let current = Vec2::new(player_tf.translation.x, player_tf.translation.z);
     let desired_end = current + direction * step;
     let swept = sweep_ground_target_indexed(

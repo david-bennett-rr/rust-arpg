@@ -16,7 +16,7 @@ pub enum PlayerSet {
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.configure_sets(Update, PlayerSet::Update)
-            .add_systems(Startup, spawn::spawn_player)
+            .add_systems(PostStartup, spawn::spawn_player)
             .add_systems(
                 Update,
                 (
@@ -27,6 +27,7 @@ impl Plugin for PlayerPlugin {
                     systems::update_attack_lunge,
                     systems::trigger_dodge,
                     systems::update_dodge,
+                    systems::update_run_state,
                     systems::use_healing_flask,
                     systems::rest_at_bonfire,
                     systems::regen_stamina,
@@ -38,7 +39,10 @@ impl Plugin for PlayerPlugin {
                     .run_if(game_running)
                     .in_set(PlayerSet::Update),
             )
-            .add_systems(Update, animation::animate_death.after(PlayerSet::Update));
+            .add_systems(
+                Update,
+                (animation::animate_rest, animation::animate_death).after(PlayerSet::Update),
+            );
     }
 }
 
@@ -48,6 +52,11 @@ pub struct Player;
 #[derive(Component)]
 pub struct MoveTarget {
     pub position: Option<Vec2>,
+}
+
+#[derive(Component, Default)]
+pub struct RunState {
+    pub active: bool,
 }
 
 #[derive(Component, Default)]
@@ -272,15 +281,16 @@ pub(super) enum KnightJoint {
 
 pub const PLAYER_COLLISION_RADIUS: f32 = 0.78;
 const MOVE_SPEED: f32 = 8.0;
+const RUN_SPEED_MULTIPLIER: f32 = 1.5;
 const ARRIVE_THRESHOLD: f32 = 0.15;
 pub const PLAYER_MAX_HP: i32 = 20;
 const ATTACK_RANGE: f32 = 2.3;
 const ATTACK_LUNGE_RANGE: f32 = 3.5;
 const ATTACK_LUNGE_STOP: f32 = 1.6;
 const ATTACK_LUNGE_DURATION: f32 = 0.12;
-const DODGE_DURATION: f32 = 0.38;
+const DODGE_DURATION: f32 = 0.54;
 const DODGE_COOLDOWN: f32 = 0.8;
-const DODGE_DISTANCE: f32 = 6.4;
+const DODGE_DISTANCE: f32 = 8.0;
 
 // Light attack (RB / left-click)
 const LIGHT_WINDUP: f32 = 0.08;
@@ -296,6 +306,7 @@ const MAX_STAMINA: f32 = 60.0;
 const STAMINA_REGEN: f32 = 18.0;
 const STAMINA_REGEN_DELAY: f32 = 0.6;
 const DODGE_STAMINA_COST: f32 = 12.0;
+const RUN_STAMINA_DRAIN: f32 = 10.0;
 
 pub fn visual_forward(transform: &Transform) -> Vec3 {
     transform.rotation * Vec3::Z
@@ -303,5 +314,6 @@ pub fn visual_forward(transform: &Transform) -> Vec3 {
 
 fn dodge_motion_curve(progress: f32) -> f32 {
     let clamped = progress.clamp(0.0, 1.0);
-    1.0 - (1.0 - clamped).powi(3)
+    // Strong ease-out so the roll carries farther, then settles with a visible slowdown.
+    1.0 - (1.0 - clamped).powi(4)
 }

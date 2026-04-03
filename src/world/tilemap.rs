@@ -588,8 +588,12 @@ pub struct ObstacleCollider {
     pub half_z: f32,
 }
 
-type WallCollisionPlayers<'w, 's> =
-    Query<'w, 's, &'static mut Transform, (With<Player>, Without<Obstacle>, Without<EnemyCollision>)>;
+type WallCollisionPlayers<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Transform,
+    (With<Player>, Without<Obstacle>, Without<EnemyCollision>),
+>;
 
 type WallCollisionEnemies<'w, 's> = Query<
     'w,
@@ -865,7 +869,12 @@ pub fn resolve_wall_collisions(
 }
 
 #[allow(dead_code)]
-fn push_out_of_obstacle(translation: &mut Vec3, radius: f32, obstacle_pos: Vec3, obstacle: &ObstacleCollider) {
+fn push_out_of_obstacle(
+    translation: &mut Vec3,
+    radius: f32,
+    obstacle_pos: Vec3,
+    obstacle: &ObstacleCollider,
+) {
     push_out_of_wall_segment(
         translation,
         radius,

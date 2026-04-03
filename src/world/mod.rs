@@ -22,6 +22,7 @@ impl Plugin for WorldPlugin {
             .init_resource::<fog::FogRuntimeState>()
             .init_resource::<WallSpatialIndex>()
             .add_systems(Startup, spawn_floor)
+            .add_systems(Update, animate_bonfire_flames)
             .add_systems(PostUpdate, tilemap::resolve_wall_collisions)
             .add_systems(
                 PostUpdate,
@@ -158,6 +159,21 @@ pub struct Bonfire {
     pub lit: bool,
 }
 
+#[derive(Component, Clone, Copy)]
+struct BonfireFlame {
+    base_translation: Vec3,
+    base_rotation: Quat,
+    base_scale: Vec3,
+    sway: f32,
+    phase: f32,
+}
+
+#[derive(Component, Clone, Copy)]
+struct BonfireGlow {
+    base_intensity: f32,
+    phase: f32,
+}
+
 const BONFIRE_COLLISION_RADIUS: f32 = 0.85;
 
 fn spawn_bonfire(
@@ -265,9 +281,7 @@ fn spawn_bonfire(
                     Mesh3d(log_mesh.clone()),
                     MeshMaterial3d(wood.clone()),
                     Transform::from_xyz(x, 0.35, z)
-                        .with_rotation(
-                            Quat::from_rotation_y(angle) * Quat::from_rotation_z(0.45),
-                        ),
+                        .with_rotation(Quat::from_rotation_y(angle) * Quat::from_rotation_z(0.45)),
                 ));
             }
 
@@ -282,25 +296,48 @@ fn spawn_bonfire(
 
             // Flame shapes (visible fire)
             parent.spawn((
+                BonfireFlame {
+                    base_translation: Vec3::new(0.0, 0.60, 0.0),
+                    base_rotation: Quat::IDENTITY,
+                    base_scale: Vec3::ONE,
+                    sway: 0.05,
+                    phase: 0.0,
+                },
                 Mesh3d(flame_mesh.clone()),
                 MeshMaterial3d(flame.clone()),
                 Transform::from_xyz(0.0, 0.60, 0.0),
             ));
             parent.spawn((
+                BonfireFlame {
+                    base_translation: Vec3::new(0.14, 0.50, 0.06),
+                    base_rotation: Quat::from_rotation_z(0.15),
+                    base_scale: Vec3::ONE,
+                    sway: 0.07,
+                    phase: 1.3,
+                },
                 Mesh3d(flame_small_mesh.clone()),
                 MeshMaterial3d(flame.clone()),
-                Transform::from_xyz(0.14, 0.50, 0.06)
-                    .with_rotation(Quat::from_rotation_z(0.15)),
+                Transform::from_xyz(0.14, 0.50, 0.06).with_rotation(Quat::from_rotation_z(0.15)),
             ));
             parent.spawn((
+                BonfireFlame {
+                    base_translation: Vec3::new(-0.10, 0.48, -0.08),
+                    base_rotation: Quat::from_rotation_z(-0.20),
+                    base_scale: Vec3::ONE,
+                    sway: 0.06,
+                    phase: 2.4,
+                },
                 Mesh3d(flame_small_mesh.clone()),
                 MeshMaterial3d(flame.clone()),
-                Transform::from_xyz(-0.10, 0.48, -0.08)
-                    .with_rotation(Quat::from_rotation_z(-0.20)),
+                Transform::from_xyz(-0.10, 0.48, -0.08).with_rotation(Quat::from_rotation_z(-0.20)),
             ));
 
             // Point light for the fire glow
             parent.spawn((
+                BonfireGlow {
+                    base_intensity: 15_000.0,
+                    phase: 0.8,
+                },
                 PointLight {
                     color: Color::srgb(1.0, 0.6, 0.2),
                     intensity: 15_000.0,
@@ -311,4 +348,37 @@ fn spawn_bonfire(
                 Transform::from_xyz(0.0, 1.2, 0.0),
             ));
         });
+}
+
+fn animate_bonfire_flames(
+    time: Res<Time>,
+    mut flames: Query<(&BonfireFlame, &mut Transform)>,
+    mut glows: Query<(&BonfireGlow, &mut PointLight)>,
+) {
+    let t = time.elapsed_secs();
+
+    for (flame, mut transform) in &mut flames {
+        let flicker = (t * 5.4 + flame.phase).sin() * 0.5
+            + (t * 9.1 + flame.phase * 1.7).sin() * 0.3
+            + (t * 13.3 + flame.phase * 0.8).sin() * 0.2;
+        let sway_x = (t * 3.1 + flame.phase).sin() * flame.sway;
+        let sway_z = (t * 2.6 + flame.phase * 1.4).cos() * flame.sway * 0.7;
+        let stretch = 1.0 + flicker * 0.10;
+        let squash = 1.0 - flicker * 0.06;
+        let lean_x = (t * 2.7 + flame.phase).sin() * 0.08;
+        let lean_z = (t * 3.5 + flame.phase * 1.2).sin() * 0.10;
+
+        transform.translation =
+            flame.base_translation + Vec3::new(sway_x, flicker.abs() * 0.05, sway_z);
+        transform.rotation =
+            flame.base_rotation * Quat::from_rotation_x(lean_x) * Quat::from_rotation_z(lean_z);
+        transform.scale = flame.base_scale * Vec3::new(squash, stretch.max(0.85), squash);
+    }
+
+    for (glow, mut light) in &mut glows {
+        let flicker = (t * 6.0 + glow.phase).sin() * 0.5
+            + (t * 11.0 + glow.phase * 1.5).sin() * 0.25
+            + (t * 15.0 + glow.phase * 0.6).sin() * 0.15;
+        light.intensity = glow.base_intensity * (1.0 + flicker * 0.14);
+    }
 }

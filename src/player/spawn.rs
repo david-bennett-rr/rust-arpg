@@ -4,21 +4,24 @@ use bevy::prelude::*;
 
 use crate::combat::{FlashTint, HitFlash, HitPoints};
 use crate::world::floor::FloorMap;
+use crate::world::tilemap::{clamp_ground_target, FloorBounds, WallSpatialIndex};
 
 use super::{
     AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, JointRest, KnightAnimator,
-    KnightJoint, MoveTarget, Player, PlayerCombat, PlayerStats, PLAYER_MAX_HP,
+    KnightJoint, MoveTarget, Player, PlayerCombat, PlayerStats, RunState, PLAYER_COLLISION_RADIUS,
+    PLAYER_MAX_HP,
 };
 
 pub(super) fn spawn_player(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    floor_map: Option<Res<FloorMap>>,
+    floor_map: Res<FloorMap>,
+    bounds: Res<FloorBounds>,
+    wall_index: Res<WallSpatialIndex>,
 ) {
-    let start = floor_map
-        .map(|fm| fm.rooms[fm.start_room].world_center + Vec3::new(0.0, 0.0, -2.5))
-        .unwrap_or(Vec3::ZERO);
+    let bonfire_pos = floor_map.rooms[floor_map.start_room].world_center;
+    let start = safe_bonfire_spawn_position(bonfire_pos, &bounds, &wall_index);
 
     let steel_color = Vec3::new(0.70, 0.74, 0.80);
     let dark_steel_color = Vec3::new(0.18, 0.21, 0.26);
@@ -119,6 +122,7 @@ pub(super) fn spawn_player(
         .spawn((
             Player,
             MoveTarget { position: None },
+            RunState::default(),
             ControllerMove::default(),
             PlayerCombat::default(),
             AttackLunge::default(),
@@ -466,4 +470,61 @@ pub(super) fn spawn_player(
                 });
             });
     });
+}
+
+fn safe_bonfire_spawn_position(
+    bonfire_pos: Vec3,
+    bounds: &FloorBounds,
+    wall_index: &WallSpatialIndex,
+) -> Vec3 {
+    let bonfire_ground = Vec2::new(bonfire_pos.x, bonfire_pos.z);
+    let distances = [3.05, 3.45, 2.75, 4.10];
+    let angle_offsets = [0.0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35, PI];
+
+    for distance in distances {
+        for angle_offset in angle_offsets {
+            let direction = Vec2::from_angle(-PI / 2.0 + angle_offset);
+            let candidate = clamp_ground_target(
+                bounds,
+                bonfire_ground + direction * distance,
+                PLAYER_COLLISION_RADIUS,
+            );
+            if bonfire_spawn_position_clear(candidate, wall_index) {
+                return Vec3::new(candidate.x, bonfire_pos.y, candidate.y);
+            }
+        }
+    }
+
+    let fallback = clamp_ground_target(
+        bounds,
+        bonfire_ground + Vec2::NEG_Y * distances[0],
+        PLAYER_COLLISION_RADIUS,
+    );
+    Vec3::new(fallback.x, bonfire_pos.y, fallback.y)
+}
+
+fn bonfire_spawn_position_clear(point: Vec2, wall_index: &WallSpatialIndex) -> bool {
+    let radius = PLAYER_COLLISION_RADIUS + 0.08;
+    let mut blocked = false;
+
+    wall_index.for_each_nearby_segment(point, radius, |segment| {
+        if blocked {
+            return;
+        }
+
+        let closest_x = point.x.clamp(
+            segment.center.x - segment.half_extents.x,
+            segment.center.x + segment.half_extents.x,
+        );
+        let closest_z = point.y.clamp(
+            segment.center.y - segment.half_extents.y,
+            segment.center.y + segment.half_extents.y,
+        );
+        let delta = point - Vec2::new(closest_x, closest_z);
+        if delta.length_squared() < radius * radius {
+            blocked = true;
+        }
+    });
+
+    !blocked
 }

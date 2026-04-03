@@ -1,3 +1,5 @@
+use std::f32::consts::PI;
+
 use bevy::ecs::system::SystemParam;
 use bevy::{input::gamepad::Gamepad, prelude::*};
 
@@ -5,9 +7,10 @@ use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
 use crate::player::{
     AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, KnightAnimator, MoveTarget,
-    Player, PlayerCombat, PlayerSet, PlayerStats,
+    Player, PlayerCombat, PlayerSet, PlayerStats, RunState, PLAYER_COLLISION_RADIUS,
 };
 use crate::targeting::TargetState;
+use crate::world::tilemap::{clamp_ground_target, FloorBounds, WallSpatialIndex};
 use crate::world::Bonfire;
 
 const BAR_WIDTH: f32 = 220.0;
@@ -25,9 +28,20 @@ const BAR_FLASH_DURATION: f32 = 0.25;
 const DEATH_TEXT_DELAY: f32 = 0.5;
 const DEATH_FADE_OUT_DURATION: f32 = 2.0;
 const DEATH_FADE_IN_DURATION: f32 = 1.5;
+const REST_SIT_DOWN_DURATION: f32 = 0.65;
+const REST_FADE_OUT_DURATION: f32 = 1.1;
+const REST_BLACK_DURATION: f32 = 0.5;
+const REST_FADE_IN_DURATION: f32 = 1.1;
+const REST_STAND_UP_DURATION: f32 = 0.7;
 
 #[derive(Event)]
 pub struct StaminaFlashEvent;
+
+#[derive(Event, Clone, Copy)]
+pub struct BonfireRestEvent {
+    pub rest_position: Vec3,
+    pub facing_rotation: Quat,
+}
 
 #[derive(Resource)]
 pub struct LastBonfirePosition(pub Vec3);
@@ -57,6 +71,70 @@ struct DeathRespawnState {
     phase: DeathPhase,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum RestPose {
+    #[default]
+    Inactive,
+    SitDown(f32),
+    Seated,
+    StandUp(f32),
+}
+
+#[derive(Clone, Copy, Default)]
+enum RestPhase {
+    #[default]
+    Inactive,
+    SitDown {
+        elapsed: f32,
+        rest_position: Vec3,
+        facing_rotation: Quat,
+    },
+    FadeOut {
+        elapsed: f32,
+        rest_position: Vec3,
+        facing_rotation: Quat,
+    },
+    Black {
+        elapsed: f32,
+        rest_position: Vec3,
+        facing_rotation: Quat,
+    },
+    FadeIn {
+        elapsed: f32,
+        facing_rotation: Quat,
+    },
+    StandUp {
+        elapsed: f32,
+        facing_rotation: Quat,
+    },
+}
+
+#[derive(Resource, Default)]
+pub struct RestTransitionState {
+    phase: RestPhase,
+}
+
+impl RestTransitionState {
+    pub fn active(&self) -> bool {
+        !matches!(self.phase, RestPhase::Inactive)
+    }
+
+    pub fn pose(&self) -> RestPose {
+        match self.phase {
+            RestPhase::Inactive => RestPose::Inactive,
+            RestPhase::SitDown { elapsed, .. } => {
+                RestPose::SitDown((elapsed / REST_SIT_DOWN_DURATION).clamp(0.0, 1.0))
+            }
+            RestPhase::FadeOut { .. } | RestPhase::Black { .. } | RestPhase::FadeIn { .. } => {
+                RestPose::Seated
+            }
+            RestPhase::StandUp { elapsed, .. } => {
+                RestPose::StandUp((elapsed / REST_STAND_UP_DURATION).clamp(0.0, 1.0))
+            }
+        }
+    }
+}
+
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
@@ -64,8 +142,11 @@ impl Plugin for HudPlugin {
         app.init_resource::<PauseMenuState>()
             .init_resource::<LastBonfirePosition>()
             .init_resource::<DeathRespawnState>()
+            .init_resource::<RestTransitionState>()
             .add_event::<StaminaFlashEvent>()
-            .add_systems(Startup, (spawn_hud, spawn_pause_menu, spawn_death_screen, init_bonfire_position))
+            .add_event::<BonfireRestEvent>()
+            .add_systems(Startup, (spawn_hud, spawn_pause_menu, spawn_death_screen))
+            .add_systems(PostStartup, init_bonfire_position)
             .add_systems(
                 PreUpdate,
                 (
@@ -81,14 +162,14 @@ impl Plugin for HudPlugin {
                     update_hud,
                     flash_hud_bars,
                     sync_pause_menu_visibility,
-                    death_respawn_sequence,
-                    (
-                        handle_pause_menu_click,
-                        sync_pause_menu_buttons,
-                    )
+                    (handle_pause_menu_click, sync_pause_menu_buttons)
                         .chain()
                         .before(PlayerSet::Update),
                 ),
+            )
+            .add_systems(
+                Update,
+                (death_respawn_sequence, bonfire_rest_sequence).after(PlayerSet::Update),
             );
     }
 }
@@ -369,6 +450,7 @@ type RestartPlayer<'w> = Option<
             &'static mut PlayerCombat,
             &'static mut AttackLunge,
             &'static mut Dodge,
+            &'static mut RunState,
             &'static mut HealingFlask,
             &'static mut MoveTarget,
             &'static mut ControllerMove,
@@ -383,6 +465,8 @@ type RestartPlayer<'w> = Option<
 #[derive(SystemParam)]
 struct RestartContext<'w, 's> {
     game_over: ResMut<'w, GameOver>,
+    bounds: Res<'w, FloorBounds>,
+    wall_index: Res<'w, WallSpatialIndex>,
     pause_menu: ResMut<'w, PauseMenuState>,
     death_screen: DeathScreenVisibilityQuery<'w, 's>,
     pause_menu_visibility: PauseMenuVisibilityQuery<'w, 's>,
@@ -418,8 +502,7 @@ impl RestartContext<'_, '_> {
         self.respawn_at_bonfire(self.last_bonfire.0);
     }
 
-    fn respawn_at_bonfire(&mut self, bonfire_pos: Vec3) {
-        self.game_over.0 = false;
+    fn prepare_player_for_rest(&mut self) {
         self.pause_menu.close();
 
         for mut visibility in &mut self.pause_menu_visibility {
@@ -428,27 +511,24 @@ impl RestartContext<'_, '_> {
 
         if let Some(player) = self.player.as_mut() {
             let (
-                ref mut transform,
-                ref mut hit_points,
-                ref mut stats,
+                _,
+                _,
+                _,
                 ref mut combat,
                 ref mut attack_lunge,
                 ref mut dodge,
-                ref mut flask,
+                ref mut run_state,
+                _,
                 ref mut move_target,
                 ref mut controller_move,
                 ref mut death_anim,
                 ref mut animator,
                 ref mut flash,
             ) = **player;
-            transform.translation = bonfire_pos + Vec3::new(0.0, 0.0, -2.5);
-            transform.rotation = Quat::IDENTITY;
-            hit_points.heal_to_full();
-            **stats = PlayerStats::default();
             **combat = PlayerCombat::default();
             **attack_lunge = AttackLunge::default();
             **dodge = Dodge::default();
-            **flask = HealingFlask::default();
+            **run_state = RunState::default();
             **controller_move = ControllerMove::default();
             **death_anim = DeathAnim::default();
             **animator = KnightAnimator::default();
@@ -458,8 +538,102 @@ impl RestartContext<'_, '_> {
 
         self.target_state.hovered = None;
         self.target_state.targeted = None;
+    }
+
+    fn place_player_at_position(&mut self, player_position: Vec3, player_rotation: Quat) {
+        self.prepare_player_for_rest();
+
+        if let Some(player) = self.player.as_mut() {
+            let (ref mut transform, _, _, _, _, _, _, _, _, _, _, _, _) = **player;
+            transform.translation = player_position;
+            transform.rotation = player_rotation;
+        }
+    }
+
+    fn restore_player_at_position(&mut self, player_position: Vec3, player_rotation: Quat) {
+        self.game_over.0 = false;
+        self.place_player_at_position(player_position, player_rotation);
+
+        if let Some(player) = self.player.as_mut() {
+            let (_, ref mut hit_points, ref mut stats, _, _, _, _, ref mut flask, _, _, _, _, _) =
+                **player;
+            hit_points.heal_to_full();
+            **stats = PlayerStats::default();
+            **flask = HealingFlask::default();
+        }
+
         self.respawn_event.send(RespawnEnemies);
     }
+
+    fn respawn_at_bonfire(&mut self, bonfire_pos: Vec3) {
+        let respawn_position =
+            safe_bonfire_player_position(bonfire_pos, Vec2::NEG_Y, &self.bounds, &self.wall_index);
+        self.restore_player_at_position(respawn_position, Quat::IDENTITY);
+    }
+}
+
+fn safe_bonfire_player_position(
+    bonfire_pos: Vec3,
+    preferred_direction: Vec2,
+    bounds: &FloorBounds,
+    wall_index: &WallSpatialIndex,
+) -> Vec3 {
+    let direction = if preferred_direction.length_squared() <= 0.0001 {
+        Vec2::NEG_Y
+    } else {
+        preferred_direction.normalize()
+    };
+    let bonfire_ground = Vec2::new(bonfire_pos.x, bonfire_pos.z);
+    let base_angle = direction.to_angle();
+    let distances = [3.05, 3.45, 2.75, 4.10];
+    let angle_offsets = [0.0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35, PI];
+
+    for distance in distances {
+        for angle_offset in angle_offsets {
+            let direction = Vec2::from_angle(base_angle + angle_offset);
+            let candidate = clamp_ground_target(
+                bounds,
+                bonfire_ground + direction * distance,
+                PLAYER_COLLISION_RADIUS,
+            );
+            if bonfire_player_position_clear(candidate, wall_index) {
+                return Vec3::new(candidate.x, bonfire_pos.y, candidate.y);
+            }
+        }
+    }
+
+    let fallback = clamp_ground_target(
+        bounds,
+        bonfire_ground + Vec2::from_angle(base_angle) * distances[0],
+        PLAYER_COLLISION_RADIUS,
+    );
+    Vec3::new(fallback.x, bonfire_pos.y, fallback.y)
+}
+
+fn bonfire_player_position_clear(point: Vec2, wall_index: &WallSpatialIndex) -> bool {
+    let radius = PLAYER_COLLISION_RADIUS + 0.08;
+    let mut blocked = false;
+
+    wall_index.for_each_nearby_segment(point, radius, |segment| {
+        if blocked {
+            return;
+        }
+
+        let closest_x = point.x.clamp(
+            segment.center.x - segment.half_extents.x,
+            segment.center.x + segment.half_extents.x,
+        );
+        let closest_z = point.y.clamp(
+            segment.center.y - segment.half_extents.y,
+            segment.center.y + segment.half_extents.y,
+        );
+        let delta = point - Vec2::new(closest_x, closest_z);
+        if delta.length_squared() < radius * radius {
+            blocked = true;
+        }
+    });
+
+    !blocked
 }
 
 fn spawn_pause_menu(mut commands: Commands) {
@@ -590,6 +764,16 @@ struct DeathSequenceContext<'w, 's> {
     restart: RestartContext<'w, 's>,
 }
 
+#[derive(SystemParam)]
+struct RestSequenceContext<'w, 's> {
+    time: Res<'w, Time>,
+    rest_state: ResMut<'w, RestTransitionState>,
+    rest_events: EventReader<'w, 's, BonfireRestEvent>,
+    death_screen_bg: Query<'w, 's, &'static mut BackgroundColor, With<DeathScreen>>,
+    death_text: Query<'w, 's, &'static mut TextColor, With<DeathText>>,
+    restart: RestartContext<'w, 's>,
+}
+
 fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
     let delta = ctx.time.delta_secs();
 
@@ -598,7 +782,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
             let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (_, ref hp, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
+            let (_, ref hp, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
             let _ = death_anim;
             if hp.is_dead() && !ctx.restart.game_over.0 {
                 ctx.restart.game_over.0 = true;
@@ -610,7 +794,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
             let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (_, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
+            let (_, _, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
             if death_anim.active && death_anim.timer.finished() {
                 for mut vis in &mut ctx.restart.death_screen {
                     *vis = Visibility::Visible;
@@ -660,13 +844,141 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
     }
 }
 
+fn bonfire_rest_sequence(mut ctx: RestSequenceContext<'_, '_>) {
+    let latest_request = ctx.rest_events.read().last().copied();
+    if !ctx.rest_state.active() {
+        let Some(BonfireRestEvent {
+            rest_position,
+            facing_rotation,
+        }) = latest_request
+        else {
+            return;
+        };
+
+        ctx.restart.prepare_player_for_rest();
+        for mut color in &mut ctx.death_text {
+            *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
+        }
+        for mut bg in &mut ctx.death_screen_bg {
+            *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0));
+        }
+        for mut vis in &mut ctx.restart.death_screen {
+            *vis = Visibility::Hidden;
+        }
+        ctx.rest_state.phase = RestPhase::SitDown {
+            elapsed: 0.0,
+            rest_position,
+            facing_rotation,
+        };
+    }
+
+    let delta = ctx.time.delta_secs();
+    match &mut ctx.rest_state.phase {
+        RestPhase::Inactive => {}
+        RestPhase::SitDown {
+            elapsed,
+            rest_position,
+            facing_rotation,
+        } => {
+            *elapsed += delta;
+            if *elapsed >= REST_SIT_DOWN_DURATION {
+                for mut vis in &mut ctx.restart.death_screen {
+                    *vis = Visibility::Visible;
+                }
+                ctx.rest_state.phase = RestPhase::FadeOut {
+                    elapsed: 0.0,
+                    rest_position: *rest_position,
+                    facing_rotation: *facing_rotation,
+                };
+            }
+        }
+        RestPhase::FadeOut {
+            elapsed,
+            rest_position,
+            facing_rotation,
+        } => {
+            *elapsed += delta;
+            let alpha = (*elapsed / REST_FADE_OUT_DURATION).clamp(0.0, 1.0);
+            for mut bg in &mut ctx.death_screen_bg {
+                *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, alpha));
+            }
+            for mut color in &mut ctx.death_text {
+                *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
+            }
+            if *elapsed >= REST_FADE_OUT_DURATION {
+                ctx.restart
+                    .restore_player_at_position(*rest_position, *facing_rotation);
+                ctx.rest_state.phase = RestPhase::Black {
+                    elapsed: 0.0,
+                    rest_position: *rest_position,
+                    facing_rotation: *facing_rotation,
+                };
+            }
+        }
+        RestPhase::Black {
+            elapsed,
+            rest_position: _rest_position,
+            facing_rotation,
+        } => {
+            *elapsed += delta;
+            for mut bg in &mut ctx.death_screen_bg {
+                *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 1.0));
+            }
+            for mut color in &mut ctx.death_text {
+                *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
+            }
+            if *elapsed >= REST_BLACK_DURATION {
+                ctx.rest_state.phase = RestPhase::FadeIn {
+                    elapsed: 0.0,
+                    facing_rotation: *facing_rotation,
+                };
+            }
+        }
+        RestPhase::FadeIn {
+            elapsed,
+            facing_rotation,
+        } => {
+            *elapsed += delta;
+            let alpha = 1.0 - (*elapsed / REST_FADE_IN_DURATION).clamp(0.0, 1.0);
+            for mut bg in &mut ctx.death_screen_bg {
+                *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, alpha));
+            }
+            for mut color in &mut ctx.death_text {
+                *color = TextColor(Color::srgba(0.7, 0.10, 0.08, 0.0));
+            }
+            if *elapsed >= REST_FADE_IN_DURATION {
+                for mut bg in &mut ctx.death_screen_bg {
+                    *bg = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0));
+                }
+                for mut vis in &mut ctx.restart.death_screen {
+                    *vis = Visibility::Hidden;
+                }
+                ctx.rest_state.phase = RestPhase::StandUp {
+                    elapsed: 0.0,
+                    facing_rotation: *facing_rotation,
+                };
+            }
+        }
+        RestPhase::StandUp {
+            elapsed,
+            facing_rotation: _facing_rotation,
+        } => {
+            *elapsed += delta;
+            if *elapsed >= REST_STAND_UP_DURATION {
+                ctx.rest_state.phase = RestPhase::Inactive;
+            }
+        }
+    }
+}
+
 fn toggle_pause_menu(
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     game_over: Res<GameOver>,
+    rest_transition: Option<Res<RestTransitionState>>,
     mut pause_menu: ResMut<PauseMenuState>,
 ) {
-    if game_over.0 {
+    if game_over.0 || rest_transition.is_some_and(|transition| transition.active()) {
         return;
     }
 
@@ -800,4 +1112,3 @@ fn handle_pause_menu_click(
         restart.execute_pause_menu_action(action);
     }
 }
-
