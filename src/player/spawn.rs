@@ -7,9 +7,10 @@ use crate::world::floor::FloorMap;
 use crate::world::tilemap::{clamp_ground_target, FloorBounds, WallSpatialIndex};
 
 use super::{
-    AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, JointRest, KnightAnimator,
-    KnightJoint, MoveTarget, Player, PlayerCombat, PlayerStats, RunState, PLAYER_COLLISION_RADIUS,
-    PLAYER_MAX_HP,
+    AttackLunge, BowState, ControllerMove, DeathAnim, Dodge, FlaskDrink, HealingFlask, Inventory,
+    JointRest,
+    KnightAnimator, KnightEquipment, KnightJoint, MoveTarget, Player, PlayerCombat, PlayerStats,
+    RunState, PLAYER_COLLISION_RADIUS, PLAYER_MAX_HP,
 };
 
 pub(super) fn spawn_player(
@@ -28,6 +29,7 @@ pub(super) fn spawn_player(
     let trim_color = Vec3::new(0.74, 0.62, 0.28);
     let plume_color = Vec3::new(0.62, 0.16, 0.18);
     let cloth_color = Vec3::new(0.15, 0.20, 0.38);
+    let wood_color = Vec3::new(0.42, 0.29, 0.15);
 
     let steel = materials.add(StandardMaterial {
         base_color: Color::srgb(steel_color.x, steel_color.y, steel_color.z),
@@ -55,6 +57,11 @@ pub(super) fn spawn_player(
     let cloth = materials.add(StandardMaterial {
         base_color: Color::srgb(cloth_color.x, cloth_color.y, cloth_color.z),
         perceptual_roughness: 0.98,
+        ..default()
+    });
+    let wood = materials.add(StandardMaterial {
+        base_color: Color::srgb(wood_color.x, wood_color.y, wood_color.z),
+        perceptual_roughness: 0.92,
         ..default()
     });
 
@@ -117,6 +124,14 @@ pub(super) fn spawn_player(
     let shield_face_mesh = meshes.add(Cylinder::new(0.26, 0.04).mesh().resolution(8));
     let shield_rim_mesh = meshes.add(Cylinder::new(0.29, 0.02).mesh().resolution(8));
     let shield_boss_mesh = meshes.add(Sphere::new(0.07).mesh().ico(1).unwrap());
+    let bow_limb_mesh = meshes.add(
+        Capsule3d::new(0.025, 0.44)
+            .mesh()
+            .longitudes(5)
+            .latitudes(4),
+    );
+    let bow_grip_mesh = meshes.add(Cylinder::new(0.035, 0.18).mesh().resolution(5));
+    let bow_string_mesh = meshes.add(Cylinder::new(0.008, 0.92).mesh().resolution(4));
 
     let player = commands
         .spawn((
@@ -137,6 +152,10 @@ pub(super) fn spawn_player(
             Visibility::Visible,
         ))
         .id();
+
+    commands.entity(player).insert(BowState::default());
+    commands.entity(player).insert(Inventory::default());
+    commands.entity(player).insert(FlaskDrink::default());
 
     commands.entity(player).with_children(|parent| {
         parent
@@ -344,6 +363,7 @@ pub(super) fn spawn_player(
                             ));
                             // Shield
                             arm.spawn((
+                                KnightEquipment::Sword,
                                 Mesh3d(shield_rim_mesh.clone()),
                                 MeshMaterial3d(dark_steel.clone()),
                                 Transform::from_xyz(-0.06, -0.30, 0.16)
@@ -355,6 +375,7 @@ pub(super) fn spawn_player(
                                 },
                             ));
                             arm.spawn((
+                                KnightEquipment::Sword,
                                 Mesh3d(shield_face_mesh.clone()),
                                 MeshMaterial3d(steel.clone()),
                                 Transform::from_xyz(-0.06, -0.30, 0.16)
@@ -366,6 +387,7 @@ pub(super) fn spawn_player(
                                 },
                             ));
                             arm.spawn((
+                                KnightEquipment::Sword,
                                 Mesh3d(shield_boss_mesh.clone()),
                                 MeshMaterial3d(trim.clone()),
                                 Transform::from_xyz(-0.06, -0.30, 0.20)
@@ -422,7 +444,61 @@ pub(super) fn spawn_player(
                                 },
                             ));
                             arm.spawn((
+                                KnightEquipment::Bow,
+                                KnightJoint::Bow,
+                                JointRest::new(
+                                    Vec3::new(-0.12, -0.28, 0.18),
+                                    Quat::from_rotation_x(0.10) * Quat::from_rotation_z(-0.08),
+                                ),
+                                Transform::from_xyz(-0.12, -0.28, 0.18).with_rotation(
+                                    Quat::from_rotation_x(0.10) * Quat::from_rotation_z(-0.08),
+                                ),
+                                Visibility::Hidden,
+                            ))
+                            .with_children(|bow| {
+                                bow.spawn((
+                                    Mesh3d(bow_grip_mesh.clone()),
+                                    MeshMaterial3d(dark_steel.clone()),
+                                    Transform::IDENTITY,
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: dark_steel_color,
+                                    },
+                                ));
+                                bow.spawn((
+                                    Mesh3d(bow_limb_mesh.clone()),
+                                    MeshMaterial3d(wood.clone()),
+                                    Transform::from_xyz(0.0, 0.30, -0.06)
+                                        .with_rotation(Quat::from_rotation_x(0.28)),
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: wood_color,
+                                    },
+                                ));
+                                bow.spawn((
+                                    Mesh3d(bow_limb_mesh.clone()),
+                                    MeshMaterial3d(wood.clone()),
+                                    Transform::from_xyz(0.0, -0.30, -0.06)
+                                        .with_rotation(Quat::from_rotation_x(-0.28)),
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: wood_color,
+                                    },
+                                ));
+                                bow.spawn((
+                                    Mesh3d(bow_string_mesh.clone()),
+                                    MeshMaterial3d(cloth.clone()),
+                                    Transform::from_xyz(0.0, 0.0, 0.05),
+                                    FlashTint {
+                                        owner: player,
+                                        base_srgb: cloth_color,
+                                    },
+                                ));
+                            });
+
+                            arm.spawn((
                                 KnightJoint::Sword,
+                                KnightEquipment::Sword,
                                 JointRest::new(
                                     Vec3::new(0.08, -0.66, 0.14),
                                     Quat::from_rotation_x(-0.78)

@@ -6,8 +6,9 @@ use crate::combat::{smoothstep01, HitPoints};
 use crate::hud::{RestPose, RestTransitionState};
 
 use super::{
-    dodge_motion_curve, AttackKind, AttackLunge, ControllerMove, DeathAnim, Dodge, JointRest,
-    KnightAnimator, KnightJoint, MoveTarget, Player, PlayerCombat, RunState, DEATH_ANIM_DURATION,
+    dodge_motion_curve, AttackKind, AttackLunge, BowState, ControllerMove, DeathAnim, Dodge,
+    FlaskDrink, JointRest, KnightAnimator, KnightEquipment, KnightJoint, MoveTarget, Player,
+    PlayerCombat, RunState, DEATH_ANIM_DURATION, FLASK_DRINK_DURATION,
 };
 
 type AnimatedPlayer<'w> = Single<
@@ -16,8 +17,10 @@ type AnimatedPlayer<'w> = Single<
         &'static MoveTarget,
         &'static ControllerMove,
         &'static Dodge,
+        &'static BowState,
         &'static RunState,
         &'static AttackLunge,
+        &'static FlaskDrink,
         &'static HitPoints,
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
@@ -34,8 +37,10 @@ pub(super) fn animate_knight(
         move_target,
         controller_move,
         dodge,
+        bow_state,
         run_state,
         attack_lunge,
+        flask_drink,
         hp,
         ref mut animator,
         ref mut combat,
@@ -46,7 +51,7 @@ pub(super) fn animate_knight(
         return;
     }
 
-    if dodge.active {
+    if dodge.active || flask_drink.active {
         animator.cancel_swing();
         combat.strike = 0.0;
     } else {
@@ -61,7 +66,7 @@ pub(super) fn animate_knight(
         0.0
     };
 
-    let moving = move_target.position.is_some() || controller_move.active();
+    let moving = !bow_state.active && (move_target.position.is_some() || controller_move.active());
     let run_blend = if run_state.active && moving { 1.0 } else { 0.0 };
     let stride_scale = 1.0 + run_blend * 0.45;
 
@@ -126,6 +131,39 @@ pub(super) fn animate_knight(
     } else {
         0.0
     };
+    let bow_charge = smoothstep01(bow_state.charge_fraction());
+    let bow_tremble = if bow_state.peak_flashed {
+        (elapsed * 28.0).sin() * 0.012
+    } else {
+        0.0
+    };
+    let bow_breath = if bow_state.active {
+        (elapsed * 2.4).sin() * 0.018
+    } else {
+        0.0
+    };
+
+    // Flask drinking: smooth lift-to-mouth curve
+    let drink_t = if flask_drink.active {
+        let t = flask_drink.timer.elapsed_secs() / FLASK_DRINK_DURATION;
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // Ease-in-out: peaks at ~40% through the animation (arm at mouth), then settles
+    let drink_lift = if flask_drink.active {
+        let raise_end = 0.4;
+        let lower_start = 0.7;
+        if drink_t < raise_end {
+            smoothstep01(drink_t / raise_end)
+        } else if drink_t < lower_start {
+            1.0
+        } else {
+            1.0 - smoothstep01((drink_t - lower_start) / (1.0 - lower_start))
+        }
+    } else {
+        0.0
+    };
 
     for (joint, rest, mut transform) in &mut joints {
         transform.translation = rest.translation;
@@ -154,6 +192,92 @@ pub(super) fn animate_knight(
                 }
                 KnightJoint::RightLeg => {
                     transform.rotation *= Quat::from_rotation_x(-roll_tuck * 0.9);
+                }
+                KnightJoint::Bow => {
+                    transform.rotation *= Quat::from_rotation_x(roll_tuck * 0.3);
+                }
+                KnightJoint::Sword => {}
+            }
+            continue;
+        }
+
+        if flask_drink.active {
+            let breath = (elapsed * 1.4).sin() * 0.008 * drink_lift;
+            match joint {
+                KnightJoint::Hips => {
+                    transform.translation.y += breath;
+                }
+                KnightJoint::Chest => {
+                    // Lean back slightly while drinking
+                    transform.rotation *= Quat::from_rotation_x(-0.12 * drink_lift);
+                }
+                KnightJoint::Head => {
+                    // Tilt head back to drink
+                    transform.rotation *= Quat::from_rotation_x(-0.28 * drink_lift);
+                }
+                KnightJoint::RightArm => {
+                    // Raise right arm up to mouth — lift and bend elbow
+                    transform.rotation *= Quat::from_rotation_x(-1.6 * drink_lift)
+                        * Quat::from_rotation_z(0.4 * drink_lift)
+                        * Quat::from_rotation_y(0.2 * drink_lift);
+                }
+                KnightJoint::LeftArm => {
+                    // Left arm relaxes at side
+                    transform.rotation *= Quat::from_rotation_x(-0.08 * drink_lift)
+                        * Quat::from_rotation_z(-0.12 * drink_lift);
+                }
+                KnightJoint::LeftLeg | KnightJoint::RightLeg => {
+                    // Slight wider stance
+                    transform.rotation *= Quat::from_rotation_x(-0.04 * drink_lift);
+                }
+                KnightJoint::Bow | KnightJoint::Sword => {}
+            }
+            continue;
+        }
+
+        if bow_state.active {
+            match joint {
+                KnightJoint::Hips => {
+                    transform.translation.y += bow_breath * 0.2 - bow_charge * 0.04;
+                    transform.rotation *= Quat::from_rotation_x(-0.08 - bow_charge * 0.04)
+                        * Quat::from_rotation_y(-0.14 * bow_charge)
+                        * Quat::from_rotation_z(-0.04);
+                }
+                KnightJoint::Chest => {
+                    transform.translation.y += bow_breath * 0.3;
+                    transform.rotation *= Quat::from_rotation_x(-0.10 - bow_charge * 0.08)
+                        * Quat::from_rotation_y(-0.28 * bow_charge + bow_tremble)
+                        * Quat::from_rotation_z(0.05);
+                }
+                KnightJoint::Head => {
+                    transform.rotation *= Quat::from_rotation_x(-0.04 + bow_charge * 0.06)
+                        * Quat::from_rotation_y(-0.12 * bow_charge + bow_tremble * 0.6)
+                        * Quat::from_rotation_z(0.04 * bow_charge);
+                }
+                KnightJoint::LeftArm => {
+                    transform.rotation *= Quat::from_rotation_x(-0.72 - bow_charge * 0.22)
+                        * Quat::from_rotation_y(0.10 + bow_charge * 0.14)
+                        * Quat::from_rotation_z(-0.34 - bow_charge * 0.12 + bow_tremble);
+                }
+                KnightJoint::RightArm => {
+                    transform.rotation *= Quat::from_rotation_x(-0.46 - bow_charge * 1.08)
+                        * Quat::from_rotation_y(-0.08 - bow_charge * 0.18)
+                        * Quat::from_rotation_z(0.82 + bow_charge * 0.22 - bow_tremble);
+                }
+                KnightJoint::LeftLeg => {
+                    transform.rotation *= Quat::from_rotation_x(0.32 + bow_charge * 0.14)
+                        * Quat::from_rotation_y(-0.10)
+                        * Quat::from_rotation_z(-0.12);
+                }
+                KnightJoint::RightLeg => {
+                    transform.rotation *= Quat::from_rotation_x(-0.26 - bow_charge * 0.08)
+                        * Quat::from_rotation_y(0.08)
+                        * Quat::from_rotation_z(0.06);
+                }
+                KnightJoint::Bow => {
+                    transform.rotation *= Quat::from_rotation_x(0.14 + bow_charge * 0.14)
+                        * Quat::from_rotation_y(-0.06)
+                        * Quat::from_rotation_z(-0.10 - bow_tremble * 0.6);
                 }
                 KnightJoint::Sword => {}
             }
@@ -187,8 +311,7 @@ pub(super) fn animate_knight(
             KnightJoint::Chest => {
                 transform.translation.y += walk_bob * 0.4 + breath * 0.014;
                 transform.rotation *= Quat::from_rotation_x(
-                    sword_windup * 0.12 - sword_strike * 0.18 + breath * 0.018
-                        - lunge_blend * 0.12
+                    sword_windup * 0.12 - sword_strike * 0.18 + breath * 0.018 - lunge_blend * 0.12
                         + thrust_windup * 0.14
                         - thrust_strike * 0.24
                         - run_blend * 0.18,
@@ -202,9 +325,7 @@ pub(super) fn animate_knight(
             }
             KnightJoint::Head => {
                 transform.rotation *= Quat::from_rotation_x(
-                    sword_windup * 0.04 - sword_strike * 0.06
-                        - breath * 0.010
-                        - walk_bob * 0.15
+                    sword_windup * 0.04 - sword_strike * 0.06 - breath * 0.010 - walk_bob * 0.15
                         + thrust_windup * 0.05
                         - thrust_strike * 0.08
                         + run_blend * 0.10,
@@ -229,8 +350,7 @@ pub(super) fn animate_knight(
                 // Light: overhead downward slash. Heavy: heavy overhead chop.
                 // Z rotation raises the arm overhead; X rotation swings it forward/down.
                 transform.rotation *= Quat::from_rotation_x(
-                    walk_swing * 0.18 + sword_windup * 0.35 - sword_strike * 1.30
-                        - breath * 0.015
+                    walk_swing * 0.18 + sword_windup * 0.35 - sword_strike * 1.30 - breath * 0.015
                         + thrust_windup * 0.45
                         - thrust_strike * 1.60
                         + walk_swing * run_blend * 0.50,
@@ -262,16 +382,30 @@ pub(super) fn animate_knight(
             KnightJoint::Sword => {
                 // Light: downward slash. Heavy: overhead chop.
                 // Windup tilts blade back (overhead); strike drives it forward/down.
-                transform.rotation *=
-                    Quat::from_rotation_x(
-                        sword_windup * 0.40 - sword_strike * 0.60 + thrust_windup * 0.45
-                            - thrust_strike * 0.80,
-                    ) * Quat::from_rotation_z(
-                        -sword_windup * 0.30 + sword_strike * 0.20
-                            - thrust_windup * 0.35 + thrust_strike * 0.25,
-                    );
+                transform.rotation *= Quat::from_rotation_x(
+                    sword_windup * 0.40 - sword_strike * 0.60 + thrust_windup * 0.45
+                        - thrust_strike * 0.80,
+                ) * Quat::from_rotation_z(
+                    -sword_windup * 0.30 + sword_strike * 0.20 - thrust_windup * 0.35
+                        + thrust_strike * 0.25,
+                );
             }
+            KnightJoint::Bow => {}
         }
+    }
+}
+
+pub(super) fn sync_bow_visuals(
+    bow_state: Single<&BowState, With<Player>>,
+    mut equipment: Query<(&KnightEquipment, &mut Visibility)>,
+) {
+    for (equipment_kind, mut visibility) in &mut equipment {
+        *visibility = match (equipment_kind, bow_state.active) {
+            (KnightEquipment::Bow, true) => Visibility::Visible,
+            (KnightEquipment::Bow, false) => Visibility::Hidden,
+            (KnightEquipment::Sword, true) => Visibility::Hidden,
+            (KnightEquipment::Sword, false) => Visibility::Visible,
+        };
     }
 }
 
@@ -360,6 +494,10 @@ pub(super) fn animate_rest(
             KnightJoint::Sword => {
                 transform.rotation *=
                     Quat::from_rotation_x(-1.18 * settle) * Quat::from_rotation_z(0.76 * settle);
+            }
+            KnightJoint::Bow => {
+                transform.rotation *=
+                    Quat::from_rotation_x(0.24 * settle) * Quat::from_rotation_z(-0.22 * settle);
             }
         }
     }
@@ -483,6 +621,10 @@ pub(super) fn animate_death(
                 // Sword drops away
                 transform.rotation *=
                     Quat::from_rotation_x(-fall * 1.2) * Quat::from_rotation_z(fall * 0.6);
+            }
+            KnightJoint::Bow => {
+                transform.rotation *=
+                    Quat::from_rotation_x(-fall * 0.7) * Quat::from_rotation_z(-fall * 0.3);
             }
             _ => {}
         }

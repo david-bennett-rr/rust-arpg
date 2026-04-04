@@ -9,10 +9,9 @@ use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::fog::FogDynamic;
 use crate::world::tilemap::{sweep_ground_target_indexed, FloorBounds, WallSpatialIndex};
 
-use super::arrow::{spawn_arrow, ArrowMeshes};
 use super::{
-    build_player_slash_state, try_player_slash, Dying, EnemyCollision, SlashTarget,
-    UniqueEnemyMaterials,
+    build_player_slash_state, spawn_enemy_arrow, try_player_slash, ArrowMeshes, Dying,
+    EnemyCollision, LootDrop, SlashTarget, UniqueEnemyMaterials,
 };
 
 #[derive(Component)]
@@ -253,6 +252,10 @@ pub(super) fn do_spawn_goblins(
                 HitFlash::default(),
                 FogDynamic::default(),
                 UniqueEnemyMaterials,
+                LootDrop {
+                    arrows: 3,
+                    chance: 0.5,
+                },
                 Transform::from_translation(home),
                 Visibility::Hidden,
             ))
@@ -668,7 +671,7 @@ pub(super) fn update_goblin_archers(
                 goblin.draw_timer = 0.0;
                 let shoot_dir = to_player.normalize_or_zero();
                 let arrow_start = goblin_ground + Vec3::Y * 1.2 + shoot_dir * 0.5;
-                spawn_arrow(&mut ctx.commands, &ctx.arrow_meshes, arrow_start, shoot_dir);
+                spawn_enemy_arrow(&mut ctx.commands, &ctx.arrow_meshes, arrow_start, shoot_dir);
             }
         } else {
             let mut move_direction = Vec3::ZERO;

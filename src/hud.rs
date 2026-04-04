@@ -6,8 +6,9 @@ use bevy::{input::gamepad::Gamepad, prelude::*};
 use crate::combat::{GameOver, HitFlash, HitPoints};
 use crate::enemy::RespawnEnemies;
 use crate::player::{
-    AttackLunge, ControllerMove, DeathAnim, Dodge, HealingFlask, KnightAnimator, MoveTarget,
-    Player, PlayerCombat, PlayerSet, PlayerStats, RunState, PLAYER_COLLISION_RADIUS,
+    AttackLunge, BowState, ControllerMove, DeathAnim, Dodge, HealingFlask, Inventory,
+    FlaskDrink, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerSet, PlayerStats, RunState,
+    PLAYER_COLLISION_RADIUS,
 };
 use crate::targeting::TargetState;
 use crate::world::tilemap::{clamp_ground_target, FloorBounds, WallSpatialIndex};
@@ -140,12 +141,16 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PauseMenuState>()
+            .init_resource::<InventoryOpen>()
             .init_resource::<LastBonfirePosition>()
             .init_resource::<DeathRespawnState>()
             .init_resource::<RestTransitionState>()
             .add_event::<StaminaFlashEvent>()
             .add_event::<BonfireRestEvent>()
-            .add_systems(Startup, (spawn_hud, spawn_pause_menu, spawn_death_screen))
+            .add_systems(
+                Startup,
+                (spawn_hud, spawn_pause_menu, spawn_inventory_screen, spawn_death_screen),
+            )
             .add_systems(PostStartup, init_bonfire_position)
             .add_systems(
                 PreUpdate,
@@ -162,6 +167,8 @@ impl Plugin for HudPlugin {
                     update_hud,
                     flash_hud_bars,
                     sync_pause_menu_visibility,
+                    sync_inventory_screen,
+                    update_inventory_contents,
                     (handle_pause_menu_click, sync_pause_menu_buttons)
                         .chain()
                         .before(PlayerSet::Update),
@@ -177,9 +184,13 @@ impl Plugin for HudPlugin {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PauseMenuAction {
     Resume,
+    Inventory,
     RestartLevel,
     Quit,
 }
+
+#[derive(Resource, Default)]
+struct InventoryOpen(bool);
 
 #[derive(Resource)]
 pub struct PauseMenuState {
@@ -218,14 +229,16 @@ impl PauseMenuState {
     fn select_previous(&mut self) {
         self.selected = match self.selected {
             PauseMenuAction::Resume => PauseMenuAction::Quit,
-            PauseMenuAction::RestartLevel => PauseMenuAction::Resume,
+            PauseMenuAction::Inventory => PauseMenuAction::Resume,
+            PauseMenuAction::RestartLevel => PauseMenuAction::Inventory,
             PauseMenuAction::Quit => PauseMenuAction::RestartLevel,
         };
     }
 
     fn select_next(&mut self) {
         self.selected = match self.selected {
-            PauseMenuAction::Resume => PauseMenuAction::RestartLevel,
+            PauseMenuAction::Resume => PauseMenuAction::Inventory,
+            PauseMenuAction::Inventory => PauseMenuAction::RestartLevel,
             PauseMenuAction::RestartLevel => PauseMenuAction::Quit,
             PauseMenuAction::Quit => PauseMenuAction::Resume,
         };
@@ -276,6 +289,9 @@ const FLASK_COLOR: Color = Color::srgb(0.85, 0.55, 0.12);
 #[derive(Component)]
 struct FlaskChargeText;
 
+#[derive(Component)]
+struct HudArrowCountText;
+
 fn spawn_hud(mut commands: Commands) {
     commands
         .spawn(Node {
@@ -317,6 +333,54 @@ fn spawn_hud(mut commands: Commands) {
                     ));
                 });
 
+            // Arrow icon + count
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|arrow_col| {
+                    // Arrow icon (head + shaft)
+                    arrow_col
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(1.0),
+                            height: Val::Px(24.0),
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        })
+                        .with_children(|icon| {
+                            icon.spawn((
+                                Node {
+                                    width: Val::Px(6.0),
+                                    height: Val::Px(6.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.6, 0.6, 0.6)),
+                            ));
+                            icon.spawn((
+                                Node {
+                                    width: Val::Px(14.0),
+                                    height: Val::Px(2.0),
+                                    ..default()
+                                },
+                                BackgroundColor(ARROW_ICON_COLOR),
+                            ));
+                        });
+                    // Count
+                    arrow_col.spawn((
+                        HudArrowCountText,
+                        Text::new("10"),
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(ARROW_ICON_COLOR),
+                    ));
+                });
+
             // Bars
             parent
                 .spawn(Node {
@@ -355,14 +419,15 @@ fn spawn_bar(parent: &mut ChildBuilder, kind: BarKind, fill_color: Color, bg_col
 
 #[allow(clippy::type_complexity)]
 fn update_hud(
-    player: Option<Single<(&HitPoints, &PlayerStats, &HealingFlask), With<Player>>>,
+    player: Option<Single<(&HitPoints, &PlayerStats, &HealingFlask, &Inventory), With<Player>>>,
     mut fills: Query<(&HudBarFill, &mut Node)>,
     mut flask_text: Single<&mut Text, With<FlaskChargeText>>,
+    mut arrow_text: Query<&mut Text, (With<HudArrowCountText>, Without<FlaskChargeText>)>,
 ) {
     let Some(player) = player else {
         return;
     };
-    let (hp, stats, flask) = *player;
+    let (hp, stats, flask, inventory) = *player;
 
     for (bar, mut node) in &mut fills {
         let pct = match bar.0 {
@@ -373,6 +438,10 @@ fn update_hud(
     }
 
     flask_text.0 = format!("{}", flask.charges);
+
+    for mut text in &mut arrow_text {
+        text.0 = format!("{}", inventory.arrows);
+    }
 }
 
 fn flash_hud_bars(
@@ -439,28 +508,30 @@ type DeathScreenVisibilityQuery<'w, 's> = Query<'w, 's, &'static mut Visibility,
 type PauseMenuVisibilityQuery<'w, 's> =
     Query<'w, 's, &'static mut Visibility, (With<PauseMenu>, Without<DeathScreen>)>;
 
+type RestartPlayerCore = (
+    &'static mut Transform,
+    &'static mut HitPoints,
+    &'static mut PlayerStats,
+    &'static mut HealingFlask,
+    &'static mut Inventory,
+);
+
+type RestartPlayerAction = (
+    &'static mut PlayerCombat,
+    &'static mut AttackLunge,
+    &'static mut Dodge,
+    &'static mut BowState,
+    &'static mut RunState,
+    &'static mut FlaskDrink,
+    &'static mut MoveTarget,
+    &'static mut ControllerMove,
+    &'static mut DeathAnim,
+    &'static mut KnightAnimator,
+    &'static mut HitFlash,
+);
+
 #[allow(clippy::type_complexity)]
-type RestartPlayer<'w> = Option<
-    Single<
-        'w,
-        (
-            &'static mut Transform,
-            &'static mut HitPoints,
-            &'static mut PlayerStats,
-            &'static mut PlayerCombat,
-            &'static mut AttackLunge,
-            &'static mut Dodge,
-            &'static mut RunState,
-            &'static mut HealingFlask,
-            &'static mut MoveTarget,
-            &'static mut ControllerMove,
-            &'static mut DeathAnim,
-            &'static mut KnightAnimator,
-            &'static mut HitFlash,
-        ),
-        With<Player>,
-    >,
->;
+type RestartPlayer<'w> = Option<Single<'w, (RestartPlayerCore, RestartPlayerAction), With<Player>>>;
 
 #[derive(SystemParam)]
 struct RestartContext<'w, 's> {
@@ -475,12 +546,16 @@ struct RestartContext<'w, 's> {
     respawn_event: EventWriter<'w, RespawnEnemies>,
     exit_event: EventWriter<'w, AppExit>,
     last_bonfire: Res<'w, LastBonfirePosition>,
+    inventory_open: ResMut<'w, InventoryOpen>,
 }
 
 impl RestartContext<'_, '_> {
     fn execute_pause_menu_action(&mut self, action: PauseMenuAction) {
         match action {
             PauseMenuAction::Resume => self.resume(),
+            PauseMenuAction::Inventory => {
+                self.inventory_open.0 = true;
+            }
             PauseMenuAction::RestartLevel => self.restart_level(),
             PauseMenuAction::Quit => {
                 self.exit_event.send(AppExit::Success);
@@ -490,12 +565,14 @@ impl RestartContext<'_, '_> {
 
     fn resume(&mut self) {
         self.pause_menu.close();
+        self.inventory_open.0 = false;
         for mut visibility in &mut self.pause_menu_visibility {
             *visibility = Visibility::Hidden;
         }
     }
 
     fn restart_level(&mut self) {
+        self.inventory_open.0 = false;
         for mut visibility in &mut self.death_screen {
             *visibility = Visibility::Hidden;
         }
@@ -504,6 +581,7 @@ impl RestartContext<'_, '_> {
 
     fn prepare_player_for_rest(&mut self) {
         self.pause_menu.close();
+        self.inventory_open.0 = false;
 
         for mut visibility in &mut self.pause_menu_visibility {
             *visibility = Visibility::Hidden;
@@ -512,28 +590,33 @@ impl RestartContext<'_, '_> {
         if let Some(player) = self.player.as_mut() {
             let (
                 _,
-                _,
-                _,
-                ref mut combat,
-                ref mut attack_lunge,
-                ref mut dodge,
-                ref mut run_state,
-                _,
-                ref mut move_target,
-                ref mut controller_move,
-                ref mut death_anim,
-                ref mut animator,
-                ref mut flash,
+                (
+                    ref mut combat,
+                    ref mut attack_lunge,
+                    ref mut dodge,
+                    ref mut bow_state,
+                    ref mut run_state,
+                    ref mut flask_drink,
+                    ref mut move_target,
+                    ref mut controller_move,
+                    ref mut death_anim,
+                    ref mut animator,
+                    ref mut flash,
+                ),
             ) = **player;
-            **combat = PlayerCombat::default();
-            **attack_lunge = AttackLunge::default();
-            **dodge = Dodge::default();
-            **run_state = RunState::default();
-            **controller_move = ControllerMove::default();
-            **death_anim = DeathAnim::default();
-            **animator = KnightAnimator::default();
-            **flash = HitFlash::default();
-            move_target.position = None;
+            reset_player_action_state(
+                combat,
+                attack_lunge,
+                dodge,
+                bow_state,
+                run_state,
+                flask_drink,
+                move_target,
+                controller_move,
+                death_anim,
+                animator,
+                flash,
+            );
         }
 
         self.target_state.hovered = None;
@@ -544,7 +627,7 @@ impl RestartContext<'_, '_> {
         self.prepare_player_for_rest();
 
         if let Some(player) = self.player.as_mut() {
-            let (ref mut transform, _, _, _, _, _, _, _, _, _, _, _, _) = **player;
+            let ((ref mut transform, ..), _) = **player;
             transform.translation = player_position;
             transform.rotation = player_rotation;
         }
@@ -555,11 +638,20 @@ impl RestartContext<'_, '_> {
         self.place_player_at_position(player_position, player_rotation);
 
         if let Some(player) = self.player.as_mut() {
-            let (_, ref mut hit_points, ref mut stats, _, _, _, _, ref mut flask, _, _, _, _, _) =
-                **player;
+            let (
+                (
+                    _,
+                    ref mut hit_points,
+                    ref mut stats,
+                    ref mut flask,
+                    ref mut inventory,
+                ),
+                _,
+            ) = **player;
             hit_points.heal_to_full();
             **stats = PlayerStats::default();
             **flask = HealingFlask::default();
+            **inventory = Inventory::default();
         }
 
         self.respawn_event.send(RespawnEnemies);
@@ -570,6 +662,40 @@ impl RestartContext<'_, '_> {
             safe_bonfire_player_position(bonfire_pos, Vec2::NEG_Y, &self.bounds, &self.wall_index);
         self.restore_player_at_position(respawn_position, Quat::IDENTITY);
     }
+}
+
+fn reset_player_action_state(
+    combat: &mut PlayerCombat,
+    attack_lunge: &mut AttackLunge,
+    dodge: &mut Dodge,
+    bow_state: &mut BowState,
+    run_state: &mut RunState,
+    flask_drink: &mut FlaskDrink,
+    move_target: &mut MoveTarget,
+    controller_move: &mut ControllerMove,
+    death_anim: &mut DeathAnim,
+    animator: &mut KnightAnimator,
+    flash: &mut HitFlash,
+) {
+    *combat = PlayerCombat::default();
+    *attack_lunge = AttackLunge::default();
+    *dodge = Dodge::default();
+    bow_state.reset();
+    *run_state = RunState::default();
+    *flask_drink = FlaskDrink::default();
+    *controller_move = ControllerMove::default();
+    *death_anim = DeathAnim::default();
+    *animator = KnightAnimator::default();
+    *flash = HitFlash::default();
+    move_target.position = None;
+}
+
+fn pause_menu_overlay_visible(pause_open: bool, inventory_open: bool) -> bool {
+    pause_open && !inventory_open
+}
+
+fn inventory_screen_visible(pause_open: bool, inventory_open: bool) -> bool {
+    pause_open && inventory_open
 }
 
 fn safe_bonfire_player_position(
@@ -685,6 +811,7 @@ fn spawn_pause_menu(mut commands: Commands) {
                     ));
 
                     spawn_pause_button(panel, PauseMenuAction::Resume, "RESUME");
+                    spawn_pause_button(panel, PauseMenuAction::Inventory, "INVENTORY");
                     spawn_pause_button(panel, PauseMenuAction::RestartLevel, "RESTART LEVEL");
                     spawn_pause_button(panel, PauseMenuAction::Quit, "QUIT");
                 });
@@ -782,8 +909,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
             let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (_, ref hp, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
-            let _ = death_anim;
+            let ((_, ref hp, ..), _) = **player;
             if hp.is_dead() && !ctx.restart.game_over.0 {
                 ctx.restart.game_over.0 = true;
                 ctx.restart.pause_menu.close();
@@ -794,7 +920,7 @@ fn death_respawn_sequence(mut ctx: DeathSequenceContext<'_, '_>) {
             let Some(player) = ctx.restart.player.as_ref() else {
                 return;
             };
-            let (_, _, _, _, _, _, _, _, _, _, ref death_anim, _, _) = **player;
+            let (_, (_, _, _, _, _, _, _, _, ref death_anim, _, _)) = **player;
             if death_anim.active && death_anim.timer.finished() {
                 for mut vis in &mut ctx.restart.death_screen {
                     *vis = Visibility::Visible;
@@ -977,6 +1103,7 @@ fn toggle_pause_menu(
     game_over: Res<GameOver>,
     rest_transition: Option<Res<RestTransitionState>>,
     mut pause_menu: ResMut<PauseMenuState>,
+    mut inventory_open: ResMut<InventoryOpen>,
 ) {
     if game_over.0 || rest_transition.is_some_and(|transition| transition.active()) {
         return;
@@ -985,8 +1112,22 @@ fn toggle_pause_menu(
     let start_pressed = gamepads
         .iter()
         .any(|gamepad| gamepad.just_pressed(GamepadButton::Start));
+    let inventory_close_pressed = keyboard.just_pressed(KeyCode::Escape)
+        || start_pressed
+        || gamepads
+            .iter()
+            .any(|gamepad| gamepad.just_pressed(GamepadButton::East));
+    if inventory_open.0 && inventory_close_pressed {
+        inventory_open.0 = false;
+        return;
+    }
+
     if keyboard.just_pressed(KeyCode::Escape) || start_pressed {
-        pause_menu.toggle();
+        if inventory_open.0 {
+            inventory_open.0 = false;
+        } else {
+            pause_menu.toggle();
+        }
     }
 }
 
@@ -994,9 +1135,10 @@ fn navigate_pause_menu(
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     mut pause_menu: ResMut<PauseMenuState>,
+    inventory_open: Res<InventoryOpen>,
     mut stick_released: Local<bool>,
 ) {
-    if !pause_menu.open {
+    if !pause_menu.open || inventory_open.0 {
         *stick_released = true;
         return;
     }
@@ -1038,7 +1180,7 @@ fn activate_pause_menu_selection(
     gamepads: Query<&Gamepad>,
     mut restart: RestartContext<'_, '_>,
 ) {
-    if !restart.pause_menu.open {
+    if !restart.pause_menu.open || restart.inventory_open.0 {
         return;
     }
 
@@ -1057,9 +1199,10 @@ fn activate_pause_menu_selection(
 
 fn sync_pause_menu_visibility(
     pause_menu: Res<PauseMenuState>,
+    inventory_open: Res<InventoryOpen>,
     mut pause_menu_query: Query<&mut Visibility, With<PauseMenu>>,
 ) {
-    let visibility = if pause_menu.open {
+    let visibility = if pause_menu_overlay_visible(pause_menu.open, inventory_open.0) {
         Visibility::Visible
     } else {
         Visibility::Hidden
@@ -1090,7 +1233,7 @@ fn handle_pause_menu_click(
     mut buttons: PauseMenuButtonInteractions<'_, '_>,
     mut restart: RestartContext<'_, '_>,
 ) {
-    if !restart.pause_menu.open {
+    if !restart.pause_menu.open || restart.inventory_open.0 {
         return;
     }
 
@@ -1110,5 +1253,266 @@ fn handle_pause_menu_click(
 
     if let Some(action) = action_to_execute {
         restart.execute_pause_menu_action(action);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory screen
+// ---------------------------------------------------------------------------
+
+const INVENTORY_COLS: usize = 5;
+const INVENTORY_ROWS: usize = 4;
+const SLOT_SIZE: f32 = 64.0;
+const SLOT_GAP: f32 = 4.0;
+const SLOT_BG: Color = Color::srgb(0.14, 0.14, 0.15);
+const SLOT_BORDER_COLOR: Color = Color::srgb(0.30, 0.30, 0.30);
+const ARROW_ICON_COLOR: Color = Color::srgb(0.85, 0.75, 0.55);
+
+#[derive(Component)]
+struct InventoryScreen;
+
+#[derive(Component)]
+struct ArrowCountText;
+
+fn spawn_inventory_screen(mut commands: Commands) {
+    commands
+        .spawn((
+            InventoryScreen,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.58)),
+            Visibility::Hidden,
+            GlobalZIndex(11),
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((
+                    Node {
+                        padding: UiRect::all(Val::Px(20.0)),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        row_gap: Val::Px(16.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.08, 0.08, 0.09, 0.94)),
+                ))
+                .with_children(|panel| {
+                    // Title
+                    panel.spawn((
+                        Text::new("INVENTORY"),
+                        TextFont {
+                            font_size: 30.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.92, 0.88, 0.76)),
+                    ));
+
+                    // Grid
+                    panel
+                        .spawn(Node {
+                            display: Display::Grid,
+                            grid_template_columns: vec![
+                                RepeatedGridTrack::px(INVENTORY_COLS as u16, SLOT_SIZE),
+                            ],
+                            grid_template_rows: vec![
+                                RepeatedGridTrack::px(INVENTORY_ROWS as u16, SLOT_SIZE),
+                            ],
+                            column_gap: Val::Px(SLOT_GAP),
+                            row_gap: Val::Px(SLOT_GAP),
+                            ..default()
+                        })
+                        .with_children(|grid| {
+                            for idx in 0..INVENTORY_COLS * INVENTORY_ROWS {
+                                let mut slot = grid.spawn((
+                                    Node {
+                                        width: Val::Px(SLOT_SIZE),
+                                        height: Val::Px(SLOT_SIZE),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        flex_direction: FlexDirection::Column,
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(SLOT_BG),
+                                    BorderColor(SLOT_BORDER_COLOR),
+                                ));
+
+                                // First slot: arrow item
+                                if idx == 0 {
+                                    slot.with_children(|slot_inner| {
+                                        // Arrow icon: a small colored triangle-ish shape
+                                        // (shaft + head as rectangles)
+                                        slot_inner
+                                            .spawn(Node {
+                                                flex_direction: FlexDirection::Row,
+                                                align_items: AlignItems::Center,
+                                                column_gap: Val::Px(1.0),
+                                                ..default()
+                                            })
+                                            .with_children(|icon_row| {
+                                                // Arrow head (triangle-ish)
+                                                icon_row.spawn((
+                                                    Node {
+                                                        width: Val::Px(8.0),
+                                                        height: Val::Px(8.0),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(Color::srgb(0.6, 0.6, 0.6)),
+                                                ));
+                                                // Arrow shaft
+                                                icon_row.spawn((
+                                                    Node {
+                                                        width: Val::Px(20.0),
+                                                        height: Val::Px(3.0),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(ARROW_ICON_COLOR),
+                                                ));
+                                            });
+
+                                        // Item name
+                                        slot_inner.spawn((
+                                            Text::new("Arrow"),
+                                            TextFont {
+                                                font_size: 11.0,
+                                                ..default()
+                                            },
+                                            TextColor(Color::srgb(0.82, 0.78, 0.68)),
+                                        ));
+
+                                        // Stack count
+                                        slot_inner.spawn((
+                                            ArrowCountText,
+                                            Text::new("10"),
+                                            TextFont {
+                                                font_size: 13.0,
+                                                ..default()
+                                            },
+                                            TextColor(Color::srgb(0.95, 0.95, 0.95)),
+                                        ));
+                                    });
+                                }
+                            }
+                        });
+
+                    // Close hint
+                    panel.spawn((
+                        Text::new("Esc / B to close"),
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.55, 0.55, 0.55)),
+                    ));
+                });
+        });
+}
+
+fn sync_inventory_screen(
+    inventory_open: Res<InventoryOpen>,
+    pause_menu: Res<PauseMenuState>,
+    mut screen: Query<&mut Visibility, With<InventoryScreen>>,
+) {
+    let visible = inventory_screen_visible(pause_menu.open, inventory_open.0);
+    for mut vis in &mut screen {
+        *vis = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+fn update_inventory_contents(
+    player: Option<Single<&Inventory, With<Player>>>,
+    mut arrow_text: Query<&mut Text, With<ArrowCountText>>,
+) {
+    let Some(player) = player else { return };
+    for mut text in &mut arrow_text {
+        text.0 = format!("{}", player.arrows);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_player_action_state_clears_flask_and_targets() {
+        let mut combat = PlayerCombat {
+            swing_id: 7,
+            strike: 0.9,
+            ..default()
+        };
+        let mut attack_lunge = AttackLunge::default();
+        let mut dodge = Dodge::default();
+        dodge.active = true;
+        let mut bow_state = BowState {
+            active: true,
+            charge_secs: 1.0,
+            peak_flashed: true,
+            fired_this_frame: true,
+        };
+        let mut run_state = RunState { active: true };
+        let mut flask_drink = FlaskDrink {
+            active: true,
+            heal_amount: 10,
+            ..default()
+        };
+        let mut move_target = MoveTarget {
+            position: Some(Vec2::new(3.0, 4.0)),
+        };
+        let mut controller_move = ControllerMove {
+            input: Vec2::new(1.0, 0.0),
+        };
+        let mut death_anim = DeathAnim {
+            active: true,
+            ..default()
+        };
+        let mut animator = KnightAnimator::default();
+        animator.walk_phase = 3.0;
+        let mut flash = HitFlash::default();
+        flash.trigger();
+
+        reset_player_action_state(
+            &mut combat,
+            &mut attack_lunge,
+            &mut dodge,
+            &mut bow_state,
+            &mut run_state,
+            &mut flask_drink,
+            &mut move_target,
+            &mut controller_move,
+            &mut death_anim,
+            &mut animator,
+            &mut flash,
+        );
+
+        assert_eq!(combat.swing_id, 0);
+        assert!(!attack_lunge.active());
+        assert!(!dodge.active);
+        assert!(!bow_state.active);
+        assert_eq!(bow_state.charge_secs, 0.0);
+        assert!(!run_state.active);
+        assert!(!flask_drink.active);
+        assert_eq!(flask_drink.heal_amount, 0);
+        assert_eq!(move_target.position, None);
+        assert_eq!(controller_move.input, Vec2::ZERO);
+        assert!(!death_anim.active);
+        assert_eq!(flash.amount(), 0.0);
+    }
+
+    #[test]
+    fn inventory_overlay_hides_pause_menu_overlay() {
+        assert!(pause_menu_overlay_visible(true, false));
+        assert!(!pause_menu_overlay_visible(true, true));
+        assert!(inventory_screen_visible(true, true));
+        assert!(!inventory_screen_visible(false, true));
     }
 }

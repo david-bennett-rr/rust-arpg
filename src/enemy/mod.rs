@@ -10,12 +10,14 @@ use smallvec::SmallVec;
 
 use crate::combat::{game_running, smoothstep01, DamageRng, HitFlash, HitPoints, StunMeter};
 use crate::player::{
-    visual_forward, AttackKind, Dodge, Player, PlayerCombat, PlayerSet, PLAYER_COLLISION_RADIUS,
+    visual_forward, AttackKind, Dodge, Inventory, Player, PlayerCombat, PlayerSet,
+    ARROW_MAX_STACK, PLAYER_COLLISION_RADIUS,
 };
 use crate::targeting::{HighlightGlow, TargetState, Targetable};
 use crate::world::tilemap::{clamp_translation, FloorBounds};
 
 pub use arrow::Arrow;
+pub(crate) use arrow::{spawn_enemy_arrow, spawn_player_arrow, ArrowMeshes};
 pub use goblin::GoblinArcher;
 pub use rat::DemonRat;
 
@@ -28,7 +30,7 @@ impl Plugin for EnemyPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<RespawnEnemies>()
             .add_systems(PreUpdate, instance_enemy_materials)
-            .add_systems(Startup, arrow::setup_arrow_meshes)
+            .add_systems(Startup, (arrow::setup_arrow_meshes, setup_loot_bag_meshes))
             .add_systems(
                 Update,
                 (
@@ -50,6 +52,7 @@ impl Plugin for EnemyPlugin {
                         // Dying tick must precede dying animations (writes Dying progress)
                         update_dying,
                         (animate_dying_rats, animate_dying_goblins),
+                        pickup_loot_bags,
                     )
                         .chain()
                         .run_if(game_running),
@@ -89,6 +92,33 @@ pub(crate) struct EnemyCollision {
     /// Share of overlap correction applied to the player (0.0 = enemy absorbs
     /// all push, 1.0 = player absorbs all push).
     pub(crate) player_push_share: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Loot system
+// ---------------------------------------------------------------------------
+
+const LOOT_BAG_PICKUP_RADIUS: f32 = 2.0;
+
+/// Attached to enemies to define what they drop on death.
+#[derive(Component, Clone)]
+pub(crate) struct LootDrop {
+    /// Number of arrows to drop (0 = no drop).
+    pub(crate) arrows: i32,
+    /// Probability of dropping (0.0–1.0).
+    pub(crate) chance: f32,
+}
+
+/// A loot bag sitting in the world, waiting to be picked up.
+#[derive(Component)]
+pub struct LootBag {
+    pub arrows: i32,
+}
+
+#[derive(Resource)]
+struct LootBagMeshes {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -184,24 +214,27 @@ pub(crate) fn try_player_slash(
             target.stun.apply_stun_damage(damage as f32);
             target.flash.trigger();
             if target.health.is_dead() {
-                // Clear targeting refs and disable collision/targeting
-                if target_state.targeted == Some(entity) {
-                    target_state.targeted = None;
-                }
-                if target_state.hovered == Some(entity) {
-                    target_state.hovered = None;
-                }
-                commands
-                    .entity(entity)
-                    .insert(Dying::new())
-                    .remove::<EnemyCollision>()
-                    .remove::<Targetable>()
-                    .remove::<HighlightGlow>();
+                kill_enemy(commands, entity, target_state);
                 return true;
             }
         }
     }
     false
+}
+
+pub(crate) fn kill_enemy(commands: &mut Commands, entity: Entity, target_state: &mut TargetState) {
+    if target_state.targeted == Some(entity) {
+        target_state.targeted = None;
+    }
+    if target_state.hovered == Some(entity) {
+        target_state.hovered = None;
+    }
+    commands
+        .entity(entity)
+        .insert(Dying::new())
+        .remove::<EnemyCollision>()
+        .remove::<Targetable>()
+        .remove::<HighlightGlow>();
 }
 
 fn resolve_actor_collisions(
@@ -382,12 +415,16 @@ fn enemy_collision_cell(position: Vec2) -> IVec2 {
 fn update_dying(
     mut commands: Commands,
     time: Res<Time>,
-    mut dying_query: Query<(Entity, &mut Dying, &mut Transform)>,
+    mut dying_query: Query<(Entity, &mut Dying, &mut Transform, Option<&LootDrop>)>,
+    loot_meshes: Option<Res<LootBagMeshes>>,
+    mut rng: ResMut<DamageRng>,
 ) {
     let delta = time.delta_secs();
-    for (entity, mut dying, mut transform) in &mut dying_query {
+    for (entity, mut dying, mut transform, loot_drop) in &mut dying_query {
         dying.timer += delta;
         let t = smoothstep01(dying.progress());
+
+        let death_position = transform.translation;
 
         // Fall sideways and sink into the ground
         transform.translation.y = -t * 0.4;
@@ -396,6 +433,12 @@ fn update_dying(
         transform.scale = Vec3::splat(shrink);
 
         if dying.timer >= dying.duration {
+            // Spawn loot bag if the enemy had a loot drop
+            if let (Some(drop), Some(ref meshes)) = (loot_drop, &loot_meshes) {
+                if drop.arrows > 0 && rng.roll_chance() <= drop.chance {
+                    spawn_loot_bag(&mut commands, meshes, death_position, drop.arrows);
+                }
+            }
             commands.entity(entity).despawn_recursive();
         }
     }
@@ -485,6 +528,7 @@ fn handle_respawn_enemies(
     rats: Query<Entity, With<DemonRat>>,
     goblins: Query<Entity, With<GoblinArcher>>,
     arrows: Query<Entity, With<Arrow>>,
+    loot_bags: Query<Entity, With<LootBag>>,
     mut ctx: EnemyRespawnContext<'_, '_>,
 ) {
     if events.is_empty() {
@@ -500,6 +544,9 @@ fn handle_respawn_enemies(
         ctx.commands.entity(e).despawn_recursive();
     }
     for e in &arrows {
+        ctx.commands.entity(e).despawn_recursive();
+    }
+    for e in &loot_bags {
         ctx.commands.entity(e).despawn_recursive();
     }
 
@@ -541,4 +588,74 @@ pub(crate) fn spawn_enemies_from_floor(
 
     rat::do_spawn_rats(commands, meshes, materials, &rat_positions);
     goblin::do_spawn_goblins(commands, meshes, materials, &goblin_positions);
+}
+
+// ---------------------------------------------------------------------------
+// Loot bag systems
+// ---------------------------------------------------------------------------
+
+fn setup_loot_bag_meshes(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mesh = meshes.add(
+        Sphere::new(0.22)
+            .mesh()
+            .ico(2)
+            .expect("ico sphere mesh"),
+    );
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.50, 0.36, 0.18),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    commands.insert_resource(LootBagMeshes { mesh, material });
+}
+
+fn spawn_loot_bag(commands: &mut Commands, meshes: &LootBagMeshes, position: Vec3, arrows: i32) {
+    commands.spawn((
+        LootBag { arrows },
+        Mesh3d(meshes.mesh.clone()),
+        MeshMaterial3d(meshes.material.clone()),
+        Transform::from_translation(Vec3::new(position.x, 0.22, position.z)),
+        Visibility::Visible,
+    ));
+}
+
+fn pickup_loot_bags(
+    mut commands: Commands,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut player: Single<(&Transform, &mut Inventory), With<Player>>,
+    bags: Query<(Entity, &Transform, &LootBag), Without<Player>>,
+) {
+    let pressed = keyboard.just_pressed(KeyCode::KeyE)
+        || gamepads
+            .iter()
+            .any(|g| g.just_pressed(GamepadButton::South));
+
+    if !pressed {
+        return;
+    }
+
+    let (player_tf, ref mut inventory) = *player;
+    let player_ground = Vec2::new(player_tf.translation.x, player_tf.translation.z);
+
+    // Pick up the nearest bag within radius
+    let mut best: Option<(Entity, f32, &LootBag)> = None;
+    for (entity, bag_tf, bag) in &bags {
+        let bag_ground = Vec2::new(bag_tf.translation.x, bag_tf.translation.z);
+        let dist = player_ground.distance(bag_ground);
+        if dist <= LOOT_BAG_PICKUP_RADIUS {
+            if best.is_none() || dist < best.unwrap().1 {
+                best = Some((entity, dist, bag));
+            }
+        }
+    }
+
+    if let Some((entity, _, bag)) = best {
+        inventory.arrows = (inventory.arrows + bag.arrows).min(ARROW_MAX_STACK);
+        commands.entity(entity).despawn_recursive();
+    }
 }

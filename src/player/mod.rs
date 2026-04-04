@@ -23,12 +23,14 @@ impl Plugin for PlayerPlugin {
                     systems::update_controller_move_state,
                     systems::handle_left_click,
                     systems::handle_controller_targeting,
+                    systems::update_bow_state,
                     systems::chase_and_attack_target,
                     systems::update_attack_lunge,
                     systems::trigger_dodge,
                     systems::update_dodge,
                     systems::update_run_state,
                     systems::use_healing_flask,
+                    systems::tick_flask_drink,
                     systems::rest_at_bonfire,
                     systems::regen_stamina,
                     systems::move_player_with_controller,
@@ -41,7 +43,12 @@ impl Plugin for PlayerPlugin {
             )
             .add_systems(
                 Update,
-                (animation::animate_rest, animation::animate_death).after(PlayerSet::Update),
+                (
+                    animation::sync_bow_visuals,
+                    animation::animate_rest,
+                    animation::animate_death,
+                )
+                    .after(PlayerSet::Update),
             );
     }
 }
@@ -52,6 +59,41 @@ pub struct Player;
 #[derive(Component)]
 pub struct MoveTarget {
     pub position: Option<Vec2>,
+}
+
+#[derive(Component)]
+pub struct BowState {
+    pub active: bool,
+    pub charge_secs: f32,
+    pub peak_flashed: bool,
+    pub fired_this_frame: bool,
+}
+
+impl Default for BowState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            charge_secs: 0.0,
+            peak_flashed: false,
+            fired_this_frame: false,
+        }
+    }
+}
+
+impl BowState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn charge_fraction(&self) -> f32 {
+        (self.charge_secs / BOW_CHARGE_DURATION).clamp(0.0, 1.0)
+    }
+
+    pub fn damage(&self) -> i32 {
+        let t = self.charge_fraction();
+        let damage_range = (BOW_MAX_DAMAGE - BOW_MIN_DAMAGE) as f32;
+        (BOW_MIN_DAMAGE as f32 + damage_range * t).round() as i32
+    }
 }
 
 #[derive(Component, Default)]
@@ -191,6 +233,32 @@ impl AttackLunge {
     }
 }
 
+pub const ARROW_MAX_STACK: i32 = 10;
+
+#[derive(Component)]
+pub struct Inventory {
+    pub arrows: i32,
+}
+
+impl Default for Inventory {
+    fn default() -> Self {
+        Self {
+            arrows: ARROW_MAX_STACK,
+        }
+    }
+}
+
+impl Inventory {
+    pub fn use_arrow(&mut self) -> bool {
+        if self.arrows > 0 {
+            self.arrows -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 const FLASK_CHARGES: i32 = 3;
 const FLASK_HEAL: i32 = 20;
 const FLASK_COOLDOWN: f32 = 0.8;
@@ -210,6 +278,27 @@ impl Default for HealingFlask {
             charges: FLASK_CHARGES,
             heal_amount: FLASK_HEAL,
             cooldown,
+        }
+    }
+}
+
+pub(crate) const FLASK_DRINK_DURATION: f32 = 0.9;
+
+#[derive(Component)]
+pub struct FlaskDrink {
+    pub timer: Timer,
+    pub active: bool,
+    pub heal_amount: i32,
+}
+
+impl Default for FlaskDrink {
+    fn default() -> Self {
+        let mut timer = Timer::from_seconds(FLASK_DRINK_DURATION, TimerMode::Once);
+        timer.tick(std::time::Duration::from_secs_f32(FLASK_DRINK_DURATION));
+        Self {
+            timer,
+            active: false,
+            heal_amount: 0,
         }
     }
 }
@@ -267,6 +356,12 @@ impl JointRest {
     }
 }
 
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KnightEquipment {
+    Sword,
+    Bow,
+}
+
 #[derive(Component, Clone, Copy)]
 pub(super) enum KnightJoint {
     Hips,
@@ -276,6 +371,7 @@ pub(super) enum KnightJoint {
     RightArm,
     LeftLeg,
     RightLeg,
+    Bow,
     Sword,
 }
 
@@ -307,6 +403,10 @@ const STAMINA_REGEN: f32 = 18.0;
 const STAMINA_REGEN_DELAY: f32 = 0.6;
 const DODGE_STAMINA_COST: f32 = 12.0;
 const RUN_STAMINA_DRAIN: f32 = 10.0;
+const BOW_CHARGE_DURATION: f32 = 1.15;
+const BOW_STAMINA_COST: f32 = 25.0;
+const BOW_MIN_DAMAGE: i32 = 1;
+const BOW_MAX_DAMAGE: i32 = 4;
 
 pub fn visual_forward(transform: &Transform) -> Vec3 {
     transform.rotation * Vec3::Z

@@ -240,6 +240,11 @@ impl DamageRng {
     pub fn roll_heavy(&mut self) -> i32 {
         self.0.next_usize(5) as i32 + 4
     }
+
+    /// Roll a float in 0.0..1.0 for probability checks.
+    pub fn roll_chance(&mut self) -> f32 {
+        (self.0.next_u64() % 1000) as f32 / 1000.0
+    }
 }
 
 pub fn smoothstep01(t: f32) -> f32 {

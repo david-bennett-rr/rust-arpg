@@ -6,6 +6,7 @@ use bevy::{input::gamepad::Gamepad, prelude::*};
 
 use crate::camera::MainCamera;
 use crate::combat::HitPoints;
+use crate::enemy::{spawn_player_arrow, ArrowMeshes};
 use crate::hud::{BonfireRestEvent, StaminaFlashEvent};
 use crate::targeting::{TargetState, Targetable};
 use crate::world::tilemap::{
@@ -15,11 +16,14 @@ use crate::world::tilemap::{
 use crate::world::Bonfire;
 
 use super::{
-    dodge_motion_curve, visual_forward, AttackKind, AttackLunge, ControllerMove, Dodge,
-    HealingFlask, KnightAnimator, MoveTarget, Player, PlayerCombat, PlayerStats, RunState,
-    ARRIVE_THRESHOLD, ATTACK_LUNGE_DURATION, ATTACK_LUNGE_RANGE, ATTACK_LUNGE_STOP, ATTACK_RANGE,
-    DODGE_DISTANCE, DODGE_STAMINA_COST, MOVE_SPEED, PLAYER_COLLISION_RADIUS, RUN_SPEED_MULTIPLIER,
-    RUN_STAMINA_DRAIN,
+    dodge_motion_curve, visual_forward, AttackKind, AttackLunge, BowState, ControllerMove, Dodge,
+    FlaskDrink, HealingFlask, Inventory, KnightAnimator, MoveTarget, Player, PlayerCombat,
+    PlayerStats, RunState,
+    ARROW_MAX_STACK, ARRIVE_THRESHOLD, ATTACK_LUNGE_DURATION, ATTACK_LUNGE_RANGE,
+    ATTACK_LUNGE_STOP, ATTACK_RANGE, BOW_CHARGE_DURATION, BOW_STAMINA_COST, DODGE_DISTANCE,
+    DODGE_STAMINA_COST, MOVE_SPEED,
+    PLAYER_COLLISION_RADIUS,
+    RUN_SPEED_MULTIPLIER, RUN_STAMINA_DRAIN,
 };
 
 type DodgePlayer<'w> = Single<
@@ -29,6 +33,9 @@ type DodgePlayer<'w> = Single<
         &'static mut Dodge,
         &'static mut MoveTarget,
         &'static ControllerMove,
+        &'static AttackLunge,
+        &'static BowState,
+        &'static FlaskDrink,
         &'static mut PlayerStats,
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
@@ -42,10 +49,30 @@ type AttackPlayer<'w> = Single<
         &'static mut Transform,
         &'static mut MoveTarget,
         &'static ControllerMove,
+        &'static BowState,
+        &'static FlaskDrink,
         &'static mut KnightAnimator,
         &'static mut PlayerCombat,
         &'static mut PlayerStats,
         &'static mut AttackLunge,
+    ),
+    With<Player>,
+>;
+
+type BowPlayer<'w> = Single<
+    'w,
+    (
+        &'static mut Transform,
+        &'static mut MoveTarget,
+        &'static Dodge,
+        &'static AttackLunge,
+        &'static mut BowState,
+        &'static mut RunState,
+        &'static KnightAnimator,
+        &'static mut PlayerCombat,
+        &'static mut PlayerStats,
+        &'static mut Inventory,
+        &'static FlaskDrink,
     ),
     With<Player>,
 >;
@@ -115,8 +142,14 @@ pub(super) fn handle_left_click(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     ctx: ClickContext<'_>,
     mut player: Single<&mut MoveTarget, With<Player>>,
+    bow_state: Single<(&BowState, &FlaskDrink), With<Player>>,
     mut target_state: ResMut<TargetState>,
 ) {
+    let (bow_state, flask_drink) = *bow_state;
+    if bow_state.active || flask_drink.active {
+        return;
+    }
+
     // Click on enemy: set target
     if mouse_buttons.just_pressed(MouseButton::Left) {
         if let Some(hovered) = target_state.hovered {
@@ -174,6 +207,7 @@ pub(super) fn handle_controller_targeting(
     gamepads: Query<&Gamepad>,
     camera_query: Option<Single<&Transform, With<MainCamera>>>,
     controller_move: Single<&ControllerMove, With<Player>>,
+    bow_state: Single<&BowState, With<Player>>,
     player: Single<&Transform, With<Player>>,
     mut ctx: ControllerTargetingContext<'_, '_>,
     mut right_stick_released: Local<bool>,
@@ -227,7 +261,7 @@ pub(super) fn handle_controller_targeting(
         *right_stick_released = true;
     }
 
-    if controller_move.active() {
+    if controller_move.active() && !bow_state.active {
         let direction = controller_move.input;
         let keep_current = ctx
             .target_state
@@ -259,6 +293,103 @@ pub(super) fn handle_controller_targeting(
             );
         }
     }
+}
+
+pub(super) fn update_bow_state(
+    mut commands: Commands,
+    time: Res<Time>,
+    gamepads: Query<&Gamepad>,
+    arrow_meshes: Res<ArrowMeshes>,
+    target_state: Res<TargetState>,
+    mut stamina_flash: EventWriter<StaminaFlashEvent>,
+    target_transforms: Query<(&GlobalTransform, &Visibility), With<Targetable>>,
+    mut player: BowPlayer<'_>,
+) {
+    let aim_held = any_gamepad_pressed(&gamepads, GamepadButton::LeftTrigger2);
+    let fire_pressed = any_gamepad_just_pressed(&gamepads, GamepadButton::RightTrigger2);
+
+    let (
+        ref mut player_tf,
+        ref mut move_target,
+        dodge,
+        attack_lunge,
+        ref mut bow_state,
+        ref mut run_state,
+        animator,
+        ref mut combat,
+        ref mut stats,
+        ref mut inventory,
+        flask_drink,
+    ) = *player;
+
+    bow_state.fired_this_frame = false;
+
+    if !aim_held {
+        bow_state.reset();
+        return;
+    }
+
+    if dodge.active || attack_lunge.active() || !animator.swing_timer.finished() || flask_drink.active {
+        bow_state.reset();
+        return;
+    }
+
+    bow_state.active = true;
+    bow_state.charge_secs = (bow_state.charge_secs + time.delta_secs()).min(BOW_CHARGE_DURATION);
+    move_target.position = None;
+    run_state.active = false;
+    combat.strike = 0.0;
+
+    let mut aim_direction = visual_forward(player_tf).normalize_or_zero();
+    if aim_direction.length_squared() <= 0.0001 {
+        aim_direction = Vec3::Z;
+    }
+
+    if let Some(target_entity) = target_state.targeted {
+        if let Ok((target_tf, visibility)) = target_transforms.get(target_entity) {
+            if *visibility != Visibility::Hidden {
+                let to_target = Vec3::new(
+                    target_tf.translation().x - player_tf.translation.x,
+                    0.0,
+                    target_tf.translation().z - player_tf.translation.z,
+                );
+                if to_target.length_squared() > 0.0001 {
+                    aim_direction = to_target.normalize();
+                    player_tf.look_to(-aim_direction, Vec3::Y);
+                }
+            }
+        }
+    }
+
+    if bow_state.charge_fraction() >= 1.0 && !bow_state.peak_flashed {
+        bow_state.peak_flashed = true;
+    }
+
+    if !fire_pressed {
+        return;
+    }
+
+    if !inventory.use_arrow() {
+        return;
+    }
+
+    if !stats.spend_stamina(BOW_STAMINA_COST) {
+        // Refund the arrow if we can't afford the stamina
+        inventory.arrows = (inventory.arrows + 1).min(ARROW_MAX_STACK);
+        stamina_flash.send(StaminaFlashEvent);
+        return;
+    }
+
+    let arrow_start = player_tf.translation + Vec3::Y * 1.24 + aim_direction * 0.92;
+    spawn_player_arrow(
+        &mut commands,
+        &arrow_meshes,
+        arrow_start,
+        aim_direction,
+        bow_state.damage(),
+    );
+    bow_state.reset();
+    bow_state.fired_this_frame = true;
 }
 
 pub(super) fn chase_and_attack_target(
@@ -301,11 +432,20 @@ pub(super) fn chase_and_attack_target(
         ref mut player_tf,
         ref mut move_target,
         controller_move,
+        bow_state,
+        flask_drink,
         ref mut animator,
         ref mut combat,
         ref mut stats,
         ref mut attack_lunge,
     ) = *player;
+
+    if bow_state.active || bow_state.fired_this_frame || flask_drink.active {
+        attack_intent.pending_strike = false;
+        attack_intent.holding = false;
+        attack_intent.windup = 0.0;
+        return;
+    }
 
     // Resolve target: face it, chase it if needed
     let mut lunge_target: Option<Vec3> = None;
@@ -455,6 +595,9 @@ pub(super) fn trigger_dodge(
         ref mut dodge,
         ref mut move_target,
         controller_move,
+        attack_lunge,
+        bow_state,
+        flask_drink,
         ref mut stats,
         ref mut animator,
         ref mut combat,
@@ -463,7 +606,14 @@ pub(super) fn trigger_dodge(
     let dodge_pressed = keyboard.just_pressed(KeyCode::Space)
         || any_gamepad_just_pressed(&gamepads, GamepadButton::East);
 
-    if !dodge_pressed || !dodge.cooldown.finished() || dodge.active {
+    if !can_trigger_dodge(
+        dodge_pressed,
+        dodge.cooldown.finished(),
+        dodge.active,
+        attack_lunge.active(),
+        bow_state.active,
+        flask_drink.active,
+    ) {
         return;
     }
 
@@ -528,6 +678,22 @@ fn dodge_progress(dodge: &Dodge) -> f32 {
     (dodge.timer.elapsed_secs() / duration).clamp(0.0, 1.0)
 }
 
+fn can_trigger_dodge(
+    dodge_pressed: bool,
+    cooldown_ready: bool,
+    dodge_active: bool,
+    attack_lunge_active: bool,
+    bow_active: bool,
+    flask_active: bool,
+) -> bool {
+    dodge_pressed
+        && cooldown_ready
+        && !dodge_active
+        && !attack_lunge_active
+        && !bow_active
+        && !flask_active
+}
+
 fn dodge_direction(
     player_tf: &Transform,
     controller_move: &ControllerMove,
@@ -556,15 +722,33 @@ pub(super) fn use_healing_flask(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
-    mut player: Single<(&mut HealingFlask, &mut HitPoints), With<Player>>,
+    mut player: Single<
+        (
+            &mut HealingFlask,
+            &mut FlaskDrink,
+            &HitPoints,
+            &Dodge,
+            &BowState,
+            &AttackLunge,
+        ),
+        With<Player>,
+    >,
 ) {
-    let (ref mut flask, ref mut hp) = *player;
+    let (ref mut flask, ref mut drink, hp, dodge, bow_state, attack_lunge) = *player;
     flask.cooldown.tick(time.delta());
 
     let pressed = keyboard.just_pressed(KeyCode::KeyQ)
         || any_gamepad_just_pressed(&gamepads, GamepadButton::North);
 
-    if !pressed || !flask.cooldown.finished() || flask.charges <= 0 || hp.current >= hp.max {
+    if !pressed
+        || !flask.cooldown.finished()
+        || flask.charges <= 0
+        || hp.current >= hp.max
+        || drink.active
+        || dodge.active
+        || bow_state.active
+        || attack_lunge.active()
+    {
         return;
     }
 
@@ -572,7 +756,29 @@ pub(super) fn use_healing_flask(
     flask.cooldown.reset();
 
     let heal = flask.heal_amount.min(hp.max - hp.current);
-    hp.current += heal;
+    drink.heal_amount = heal;
+    drink.active = true;
+    drink.timer.reset();
+}
+
+pub(super) fn tick_flask_drink(
+    time: Res<Time>,
+    mut player: Single<(&mut FlaskDrink, &mut HitPoints, &mut MoveTarget), With<Player>>,
+) {
+    let (ref mut drink, ref mut hp, ref mut move_target) = *player;
+
+    if !drink.active {
+        return;
+    }
+
+    move_target.position = None;
+    drink.timer.tick(time.delta());
+
+    if drink.timer.finished() {
+        hp.current = (hp.current + drink.heal_amount).min(hp.max);
+        drink.active = false;
+        drink.heal_amount = 0;
+    }
 }
 
 pub(super) fn rest_at_bonfire(
@@ -701,6 +907,8 @@ pub(super) fn update_run_state(
         (
             &ControllerMove,
             &Dodge,
+            &BowState,
+            &FlaskDrink,
             &AttackLunge,
             &mut PlayerStats,
             &mut RunState,
@@ -708,7 +916,13 @@ pub(super) fn update_run_state(
         With<Player>,
     >,
 ) {
-    let (controller_move, dodge, attack_lunge, ref mut stats, ref mut run_state) = *player;
+    let (controller_move, dodge, bow_state, flask_drink, attack_lunge, ref mut stats, ref mut run_state) =
+        *player;
+
+    if bow_state.active || flask_drink.active {
+        run_state.active = false;
+        return;
+    }
 
     let run_held =
         keyboard.pressed(KeyCode::Space) || any_gamepad_pressed(&gamepads, GamepadButton::East);
@@ -728,6 +942,8 @@ pub(super) fn move_player_with_controller(
             &mut MoveTarget,
             &ControllerMove,
             &Dodge,
+            &BowState,
+            &FlaskDrink,
             &RunState,
         ),
         With<Player>,
@@ -736,9 +952,10 @@ pub(super) fn move_player_with_controller(
     bounds: Res<FloorBounds>,
     wall_index: Res<WallSpatialIndex>,
 ) {
-    let (ref mut player_tf, ref mut move_target, controller_move, dodge, run_state) = *player_query;
+    let (ref mut player_tf, ref mut move_target, controller_move, dodge, bow_state, flask_drink, run_state) =
+        *player_query;
 
-    if dodge.active {
+    if dodge.active || bow_state.active || flask_drink.active {
         return;
     }
 
@@ -776,14 +993,14 @@ pub(super) fn move_player_with_controller(
 }
 
 pub(super) fn move_player(
-    mut player_query: Single<(&mut Transform, &mut MoveTarget, &Dodge), With<Player>>,
+    mut player_query: Single<(&mut Transform, &mut MoveTarget, &Dodge, &BowState, &FlaskDrink), With<Player>>,
     time: Res<Time>,
     bounds: Res<FloorBounds>,
     wall_index: Res<WallSpatialIndex>,
 ) {
-    let (ref mut player_tf, ref mut move_target, dodge) = *player_query;
+    let (ref mut player_tf, ref mut move_target, dodge, bow_state, flask_drink) = *player_query;
 
-    if dodge.active {
+    if dodge.active || bow_state.active || flask_drink.active {
         return;
     }
 
@@ -1045,5 +1262,17 @@ mod tests {
             AttackKind::Light.windup()
         ));
         assert_eq!(intent.windup, 0.0);
+    }
+
+    #[test]
+    fn dodge_is_blocked_while_attack_lunge_is_active() {
+        assert!(!can_trigger_dodge(true, true, false, true, false, false));
+    }
+
+    #[test]
+    fn dodge_requires_button_and_ready_state() {
+        assert!(can_trigger_dodge(true, true, false, false, false, false));
+        assert!(!can_trigger_dodge(false, true, false, false, false, false));
+        assert!(!can_trigger_dodge(true, false, false, false, false, false));
     }
 }
